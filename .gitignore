@@ -1,0 +1,12 @@
+node_modules/
+dist/
+reports/
+reports.zip
+*.zip
+.env
+*.log
+.DS_Store
+.playwright-mcp/
+playwright-report/
+test-results/
+.latest-run.json

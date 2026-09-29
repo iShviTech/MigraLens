@@ -1,0 +1,156 @@
+---
+description: Live vs stage full-page content, image, SEO, and link compare via Playwright MCP (dual auth, strict pass rules)
+alwaysApply: false
+---
+
+# Live vs Stage Content, Image, SEO, and Link Compare
+
+Use this playbook when the user asks to compare live and stage page content, images, SEO tags, or in-page links, run a content compare, or verify migration content parity.
+
+The command for this job is `npm run content-compare` (`scripts/content-compare/run.js`). Prefer that over driving the browser by hand. It reads `.env`, applies only the stage auth layers that are enabled, writes `by-path/*.json`, and renders `summary.html`.
+
+## Read-only (strict)
+
+Do **not** edit any content. Use read-only access only.
+
+- Never create, update, delete, publish, unpublish, or save content on live or stage.
+- Never click Add content, Edit, Layout, Edit layout, Save, Delete, Publish, or any other write control.
+- Allowed: GET/HEAD navigation, reading the DOM, clicking popup **dismiss** controls, and FAIL screenshots.
+- The only allowed POST is the Drupal login form, and only when `STAGE_DRUPAL_LOGIN=true`. After login, every later request stays read-only.
+- Live is a public website. Never send credentials, cookies, or a login to `LIVE_URL`.
+
+## Preconditions
+
+1. Read `.env` for `LIVE_URL`, `STAGE_URL`, `STAGE_BASIC_AUTH`, `STAGE_BASIC_USER`, `STAGE_BASIC_PASS`, `STAGE_DRUPAL_LOGIN`, `STAGE_LOGIN_PATH` (default `/member/login`), `STAGE_DRUPAL_USER`, `STAGE_DRUPAL_PASS`, `COMPARE_PATHS`, and optional `LIVE_MAIN_SELECTOR`, `STAGE_MAIN_SELECTOR`, `LIVE_POPUP_CLOSE_SELECTORS`, `STAGE_POPUP_CLOSE_SELECTORS`, `IMAGE_HASH_THRESHOLD`.
+2. Never echo passwords or basic-auth credentials in chat, reports, or screenshots of filled forms.
+3. `LIVE_URL` and `STAGE_URL` are required. Live never needs credentials. Require `STAGE_BASIC_USER` / `STAGE_BASIC_PASS` only when `STAGE_BASIC_AUTH=true`. Require `STAGE_DRUPAL_USER` / `STAGE_DRUPAL_PASS` only when `STAGE_DRUPAL_LOGIN=true`. If a required value is missing, stop and ask the user to fill `.env`. Do not invent hosts or passwords.
+4. Use the project Playwright MCP (`project-0-MigraLens-playwright` / `playwright`). Prefer two tabs: one live, one stage.
+
+## Path inventory
+
+- If `COMPARE_PATHS` is set: split on commas, trim, ensure leading `/`.
+- Else: read `reports/url/urls-flat.json`, take pathnames only, remap onto `LIVE_URL` and `STAGE_URL`.
+- Pair by path only: `{LIVE_URL}{path}` ↔ `{STAGE_URL}{path}`.
+- Process 5–10 paths per turn; write progress so the run is resumable.
+
+## Stage auth (once per session, only enabled layers)
+
+Both stage layers are optional and come only from `.env`. Skip a layer when its flag is `false`, empty, or anything other than `1` / `true` / `yes` / `on`. Do not fall back to hard-coded credentials.
+
+`browser_navigate` has no `httpCredentials`. Order when a layer is enabled:
+
+1. **HTTP Basic Auth** — only if `STAGE_BASIC_AUTH=true`. Navigate to  
+   `https://{STAGE_BASIC_USER}:{STAGE_BASIC_PASS}@{stageHost}/`  
+   If that fails, use `browser_run_code_unsafe` to set context HTTP credentials, then navigate to `STAGE_URL`.
+2. **Drupal login** — only if `STAGE_DRUPAL_LOGIN=true`. Navigate to `{STAGE_URL}{STAGE_LOGIN_PATH}` (default `/member/login`). Fill username/password with `browser_fill_form` / `browser_type`, submit with `browser_click`, confirm with `browser_snapshot` that the login form is gone. This login POST is the only write allowed in the whole run.
+3. Keep the same stage tab/context for all stage visits (cookies must persist when login ran).
+4. Live: navigate `{LIVE_URL}{path}` with no auth. Live is public.
+
+**Hard stop:** If stage returns a login wall, 401, or 403 after the enabled layers, set `authStatus` to failed in `manifest.json` and do not mark any path `PASS`. Do not enable a layer the user turned off in order to get past that wall.
+
+## Per-path procedure
+
+The site is migrating from WordPress to Drupal, so UI, markup, and page layout are **expected** to differ. Compare content, not layout. Never skip or drop real content to make a page pass.
+
+For each path:
+
+1. Open live URL → wait for network idle.
+2. **Close popups** (see below) → scroll to load lazy images → close popups again.
+3. Run fingerprint extract (see below).
+4. Open stage URL (authenticated tab) → same steps.
+5. Diff strictly (rules below).
+6. Write `by-path/{slug}.json` immediately.
+7. On FAIL: `browser_take_screenshot` into `screenshots/` for evidence.
+
+### Popups (close before compare)
+
+Live shows popups that are not page content. For example, a GTranslate geo popup offers "YES - GO TO THE GER WEBSITE" and "NO - STAY ON THE CANADA WEBSITE". There can also be cookie banners and modals. Close them before extracting.
+
+- `run.js` does this automatically with `dismissPopups()`: it presses Escape, then clicks visible dismiss controls from the built-in list plus `LIVE_POPUP_CLOSE_SELECTORS` / `STAGE_POPUP_CLOSE_SELECTORS`.
+- When driving Playwright MCP by hand: run `browser_snapshot`, find the popup's **dismiss** control (for the geo popup: `a[class*="redirectpopup"][class$="_closetext"]`, "NO - STAY ON THE CANADA WEBSITE"), `browser_click` it, then `browser_snapshot` again to confirm it is gone and the URL did not change.
+- **Never** click a control that navigates away or accepts a redirect (for example "YES - GO TO …"). Closing a popup is client-side only and stays read-only.
+- The extractor also excludes any popup still in the DOM (`[role=dialog]`, `[aria-modal=true]`, `dialog`, geo-redirect, cookie-consent containers) and lists its text under `excludedPopups`. The report shows it in the comment, so nothing is dropped silently.
+
+### Drupal admin UI (never content)
+
+Stage is viewed logged in, so it carries Drupal admin UI: toolbar, View/Edit/Delete/**Layout** tabs, **Edit layout** and Layout Builder controls, contextual "Configure block" links, and status messages. Follow the skill [`.cursor/skills/drupal-admin-ignore/SKILL.md`](.cursor/skills/drupal-admin-ignore/SKILL.md). The extractor drops these through `ADMIN_SELECTORS`, `ADMIN_PATH`, `ADMIN_TAB_TEXT`, and `ADMIN_BUTTON_TEXT`. Add new admin controls there, never by hand in the diff or report.
+
+### Fingerprint extract
+
+Use MCP `browser_evaluate` with the function in [`scripts/content-compare/extract-fingerprint.js`](scripts/content-compare/extract-fingerprint.js) (optionally call it with `{ mainSelector }`). It returns main-content `textBlocks`, `headings`, `pageText`, `links`, `images` (real source resolved from lazy attributes, plus CSS backgrounds), `seo`, `mainSelectorUsed`, and `excludedPopups`.
+
+Diff with `diffFingerprints(live, stage, { visual })` from [`scripts/content-compare/diff-fingerprints.js`](scripts/content-compare/diff-fingerprints.js). `visual` comes from `computeVisual()` in `run.js`. Without it, images fall back to asset-key comparison, which is not a valid image PASS for this migration, so prefer `npm run content-compare`.
+
+### Scope: main content only
+
+Text, headings, images, and links come from the main-content root. That root is `LIVE_MAIN_SELECTOR` / `STAGE_MAIN_SELECTOR`, else the first of `main`, `[role=main]`, `#main-content`, `#main`, `.site-main`, `#content`, else body without header, nav, footer, and aside. The site header, navigation, and footer are out of scope. SEO comes from `<head>`. If either side has under 50 characters of main text, the page is `ERROR`, not `PASS`.
+
+### Content pass rules (strict, text only)
+
+- Text is split into blocks at block-element boundaries (p, h1–h6, li, td, div, and so on). Hidden accordion and tab text is included. Screen-reader-only text and slider clones are excluded.
+- Normalize both sides: NFKC, **lowercase** ("About Us" = "ABOUT US"), curly quotes become straight quotes, dashes become `-`, NBSP and zero-width characters are removed, and whitespace is collapsed. Punctuation and wording are kept.
+- Every live block must appear in the stage main text, and every stage block must appear in the live main text. **Order and layout do not matter.** Heading level (H1 vs H2) does not matter. Heading text does.
+- Any missing, extra, or reworded text → content No. The full lists are in `diff.details.textMissingOnStage` / `textOnlyOnStage`.
+
+### Image pass rules (strict, visual)
+
+- Images are the same when they **look** the same. Each image is fetched, decoded, and compared with a 64-bit perceptual dHash. When aspect ratios differ, the wider image is cropped at several offsets and the closest crop counts. Distance must be ≤ `IMAGE_HASH_THRESHOLD` (default 10).
+- Filename, URL, alt text, rendition size, and order are **ignored**.
+- Every distinct live image needs a visual match on stage, and every distinct stage image needs one on live. Otherwise image No.
+- A stage image that fails to load or decode → image No. A live image that cannot be loaded, or is still a lazy placeholder, also fails (it cannot be verified).
+- Full lists are in `diff.details.imagesMissingOnStage` / `imagesOnlyOnStage` / `imagesFailedOnLive` / `imagesFailedOnStage`. Hashes and the distance matrix are in the record's `visual`.
+
+### SEO pass rules (strict)
+
+Compare `seo` after whitespace normalize. Canonical path and `og:image` asset key ignore host.
+
+- `title`, `description`, `robots`
+- `keywords` as a trimmed, sorted set (order alone does not fail; comment lists missing and extra keywords)
+- `canonicalPath`
+- `ogTitle`, `ogDescription`, `ogImage`
+- `twitterTitle`, `twitterDescription`
+
+### URL pass rules (strict)
+
+Compare ordered in-page links (`pathname` + link text) from the main-content root. `http(s)` and relative links use pathname only, so hosts are ignored. `mailto:` and `tel:` keep the raw href.
+
+## Verdicts
+
+Per path: `PASS` only when content, image, SEO, and URL are all Yes. Otherwise `FAIL`. `ERROR` when a fingerprint is missing. Do not mark `PASS` if stage returned login or 403.
+
+`by-path/{slug}.json` shape:
+
+```json
+{
+  "page": "/about",
+  "liveUrl": "https://live.example/about",
+  "stageUrl": "https://stage.example/about",
+  "live": {},
+  "stage": {},
+  "diff": {
+    "contentMatch": "Yes",
+    "imageMatch": "No",
+    "seoMatch": "Yes",
+    "urlMatch": "Yes",
+    "comment": "image[0] alt differs",
+    "verdict": "FAIL"
+  }
+}
+```
+
+## Artifacts
+
+Write under `reports/content-compare/{YYYY-MM-DD}/{HHmmss}/`:
+
+| File | Purpose |
+|------|---------|
+| `manifest.json` | hosts, paths, authStatus, started/finished |
+| `by-path/{slug}.json` | fingerprints, `visual` (image hashes + distance matrix), diff (four Yes/No columns, structured comment (numbered sections such as "1. Images", "- " sub-headings with Live/Stage lines, up to 5 items then "N more", and a Notes section for scope and closed popups), full `details` lists, verdict) |
+| `summary.json` | rows plus pass/fail counts |
+| `summary.md` | markdown table: Page, Content match, Image match, SEO Tags match, URL match, Comment, Screenshots |
+| `summary.html` | same table, Yes/No colored, live/stage screenshot thumbnails |
+| `screenshots/{slug}/` | FAIL evidence only: `live-full.png`, `stage-full.png`, and up to 8 `el-NN-live.png` / `el-NN-stage.png` crops of differing text blocks, images, and links (element outlined in red) |
+
+## After the batch
+
+`npm run content-compare` already writes `summary.json`, `summary.md`, and `summary.html`. Tell the user the run folder path, the `summary.html` path, and pass/fail counts. Offer to continue the next batch of paths if inventory remains.

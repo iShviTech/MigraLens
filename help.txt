@@ -1,0 +1,4 @@
+Enhance current content comapre code 
+i want to comapre full page content with image also i want to comapre SEO tags like meta tags keywords 
+i want report like 
+page -> content match ( yes or No ) -> image match ( yes or No ) -> SEO Tags match ( yes or No ) -> URL match ( yes or No ) -> Comment ( if any discriptionce )

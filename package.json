@@ -1,0 +1,46 @@
+{
+  "name": "migralens",
+  "version": "1.0.0",
+  "description": "Playwright crawler with axe-core accessibility and Lighthouse / PageSpeed Insights performance audits for site migrations (WordPress to Drupal).",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "init-env": "tsx src/cli/init-env.ts",
+    "scrape": "tsx src/cli/scrape.ts",
+    "audit:a11y": "tsx src/cli/audit-a11y.ts",
+    "audit:perf": "tsx src/cli/audit-perf.ts",
+    "compare": "tsx src/cli/compare.ts",
+    "content-compare": "node scripts/content-compare/run.js",
+    "report": "tsx src/cli/report.ts",
+    "generate-report": "node scripts/generate-report.js",
+    "generate-comparison-report": "node scripts/generate-comparison-report.js",
+    "run-all": "tsx src/cli/run-all.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "accessibility",
+    "lighthouse",
+    "pagespeed",
+    "playwright",
+    "migration",
+    "axe",
+    "mcp"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "dotenv": "^16.4.7",
+    "p-limit": "^6.2.0",
+    "playwright": "^1.51.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
