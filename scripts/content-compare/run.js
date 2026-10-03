@@ -7,7 +7,9 @@
  * Live is always public (no credentials). Stage HTTP Basic Auth and Drupal login
  * run only when STAGE_BASIC_AUTH / STAGE_DRUPAL_LOGIN are true.
  * The only allowed POST is the Drupal login form, and only while that flag is true.
- * Writes reports/content-compare/{YYYY-MM-DD}/{HHmmss}/ including summary.html.
+ * Writes reports/content-compare/{YYYY-MM-DD}/{HHmmss}/ including summary.html and dashboard.html.
+ * Speed knobs: COMPARE_CONCURRENCY, COMPARE_IDLE_MS, COMPARE_BLOCK_HOSTS, COMPARE_FULL_SCREENSHOTS,
+ * and COMPARE_RESUME (an existing run folder to finish).
  */
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -15,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { config as loadDotenv } from "dotenv";
 import { chromium } from "playwright";
 import { diffFingerprints, pathToSlug } from "./diff-fingerprints.js";
+import { renderDashboard } from "./render-dashboard.js";
 import { renderSummary } from "./render-summary.js";
 
 loadDotenv();
@@ -107,10 +110,54 @@ async function loadPaths(outputDir) {
 
 const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-async function enforceReadOnly(context, allowLoginPost) {
+// Third-party trackers and embeds that never carry page content. Consent and popup
+// scripts are deliberately absent so popups still render and get dismissed.
+const DEFAULT_BLOCK_HOSTS = [
+  "googletagmanager.com",
+  "google-analytics.com",
+  "analytics.google.com",
+  "doubleclick.net",
+  "googlesyndication.com",
+  "googleadservices.com",
+  "connect.facebook.net",
+  "hotjar.com",
+  "clarity.ms",
+  "bat.bing.com",
+  "snap.licdn.com",
+  "px.ads.linkedin.com",
+  "static.ads-twitter.com",
+  "analytics.tiktok.com",
+  "youtube.com",
+  "youtube-nocookie.com",
+  "player.vimeo.com"
+];
+
+function blockHostsFromEnv() {
+  const raw = (process.env.COMPARE_BLOCK_HOSTS || "").trim();
+  if (!raw) return DEFAULT_BLOCK_HOSTS;
+  if (raw.toLowerCase() === "none") return [];
+  return envList("COMPARE_BLOCK_HOSTS").map((host) => host.toLowerCase());
+}
+
+function isBlockedHost(url, blockHosts) {
+  if (!blockHosts.length) return false;
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return blockHosts.some((blocked) => host === blocked || host.endsWith(`.${blocked}`));
+}
+
+async function enforceReadOnly(context, allowLoginPost, blockHosts = []) {
   await context.route("**/*", (route) => {
     const request = route.request();
     const method = request.method().toUpperCase();
+    // Images are never blocked: the extractor reads naturalWidth/broken from them.
+    if (request.resourceType() !== "image" && isBlockedHost(request.url(), blockHosts)) {
+      return route.abort("blockedbyclient");
+    }
     if (READ_ONLY_METHODS.has(method)) return route.continue();
     if (allowLoginPost?.current && method === "POST") {
       try {
@@ -154,9 +201,33 @@ const DEFAULT_POPUP_CLOSE_SELECTORS = [
   '[class*="modal"] [aria-label*="close" i]'
 ];
 
+/** One round trip: keep only selectors with a visible match (non-CSS selectors are kept). */
+async function visibleSelectors(page, selectors) {
+  return page
+    .evaluate(
+      (list) =>
+        list.filter((selector) => {
+          let nodes;
+          try {
+            nodes = document.querySelectorAll(selector);
+          } catch {
+            return true;
+          }
+          for (const el of nodes) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden") return true;
+          }
+          return false;
+        }),
+      selectors
+    )
+    .catch(() => selectors);
+}
+
 async function dismissPopups(page, extraSelectors, closed) {
   await page.keyboard.press("Escape").catch(() => {});
-  for (const selector of [...extraSelectors, ...DEFAULT_POPUP_CLOSE_SELECTORS]) {
+  const candidates = await visibleSelectors(page, [...extraSelectors, ...DEFAULT_POPUP_CLOSE_SELECTORS]);
+  for (const selector of candidates) {
     let matches;
     try {
       matches = await page.locator(selector).all();
@@ -197,20 +268,28 @@ async function dismissPopups(page, extraSelectors, closed) {
   }
 }
 
-async function openAndExtract(page, url, timeout, extractSource, { mainSelector = "", popupSelectors = [] } = {}) {
+async function openAndExtract(
+  page,
+  url,
+  timeout,
+  extractSource,
+  { mainSelector = "", headerSelector = "", footerSelector = "", popupSelectors = [], idleMs = 5_000 } = {}
+) {
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-  await page.waitForLoadState("networkidle", { timeout: Math.min(timeout, 15_000) }).catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: Math.min(timeout, idleMs) }).catch(() => {});
   const popupsClosed = [];
   await dismissPopups(page, popupSelectors, popupsClosed);
   await page.evaluate(async () => {
     const step = Math.max(window.innerHeight, 400);
     for (let y = 0, i = 0; y < document.documentElement.scrollHeight && i < 60; y += step, i++) {
       window.scrollTo(0, y);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 80));
     }
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    await new Promise((resolve) => setTimeout(resolve, 150));
     window.scrollTo(0, 0);
   });
-  await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: 2_000 }).catch(() => {});
   // Lazy images outside the viewport never load, so decode() can stay pending forever.
   await page.evaluate(async () => {
     const withTimeout = (promise, ms) =>
@@ -219,7 +298,7 @@ async function openAndExtract(page, url, timeout, extractSource, { mainSelector 
       Promise.all(
         Array.from(document.images).map((img) => (img.decode ? withTimeout(img.decode(), 3_000) : Promise.resolve()))
       ),
-      10_000
+      5_000
     );
   });
   await dismissPopups(page, popupSelectors, popupsClosed);
@@ -228,7 +307,7 @@ async function openAndExtract(page, url, timeout, extractSource, { mainSelector 
       const fn = (0, eval)(code);
       return fn(options);
     },
-    { code: extractSource, options: { mainSelector } }
+    { code: extractSource, options: { mainSelector, headerSelector, footerSelector } }
   );
   fingerprint.popupsClosed = popupsClosed;
   return { response, fingerprint };
@@ -257,14 +336,35 @@ async function fetchImageDataUrl(context, url, timeout) {
   return `data:${type};base64,${body.toString("base64")}`;
 }
 
-/** Decode images in the scratch page and keep 256px canvases there for hashing. */
-async function loadIntoScratch(scratchPage, context, prefix, urls, timeout) {
-  const entries = [];
-  for (const [index, url] of urls.entries()) {
-    const key = `${prefix}${index}`;
-    try {
-      const dataUrl = await fetchImageDataUrl(context, url, timeout);
-      const decoded = await scratchPage.evaluate(
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+const IMAGE_FETCH_CONCURRENCY = 6;
+// Each cached canvas is at most 256x256 RGBA (~256 KB), so this caps scratch memory near 100 MB.
+const IMAGE_CACHE_LIMIT = 400;
+
+/**
+ * Per-worker LRU of decoded images, keyed by side + URL. Repeated images (logos,
+ * shared banners) are fetched and decoded once; failures are not cached.
+ */
+function createImageCache(scratchPage, limit = IMAGE_CACHE_LIMIT) {
+  const entries = new Map();
+  let counter = 0;
+
+  async function decode(context, url, timeout) {
+    const key = `i${counter++}`;
+    const dataUrl = await fetchImageDataUrl(context, url, timeout);
+    const decoded = await scratchPage.evaluate(
         async ({ key, dataUrl }) => {
           window.__mlImages = window.__mlImages || {};
           const img = new Image();
@@ -284,15 +384,49 @@ async function loadIntoScratch(scratchPage, context, prefix, urls, timeout) {
           window.__mlImages[key] = canvas;
           return { width: img.naturalWidth, height: img.naturalHeight };
         },
-        { key, dataUrl }
-      );
-      entries.push({ url, key, ...decoded });
-    } catch (error) {
-      const message = error instanceof Error ? error.message.split("\n")[0] : String(error);
-      entries.push({ url, key, error: /decode/i.test(message) ? "could not decode" : message.slice(0, 120) });
-    }
+      { key, dataUrl }
+    );
+    return { key, ...decoded };
   }
-  return entries;
+
+  async function load(side, context, urls, timeout) {
+    return mapLimit(urls, IMAGE_FETCH_CONCURRENCY, async (url) => {
+      const id = `${side} ${url}`;
+      const cached = entries.get(id);
+      if (cached) {
+        entries.delete(id);
+        entries.set(id, cached);
+        return { url, ...cached };
+      }
+      try {
+        const loaded = await decode(context, url, timeout);
+        entries.set(id, loaded);
+        return { url, ...loaded };
+      } catch (error) {
+        const message = error instanceof Error ? error.message.split("\n")[0] : String(error);
+        return { url, key: null, error: /decode/i.test(message) ? "could not decode" : message.slice(0, 120) };
+      }
+    });
+  }
+
+  async function trim(keepKeys) {
+    const dropIds = [];
+    for (const [id, entry] of entries) {
+      if (entries.size - dropIds.length <= limit) break;
+      if (!keepKeys.has(entry.key)) dropIds.push(id);
+    }
+    if (!dropIds.length) return;
+    const keys = dropIds.map((id) => entries.get(id).key);
+    for (const id of dropIds) entries.delete(id);
+    await scratchPage.evaluate((dropKeys) => {
+      for (const key of dropKeys) {
+        if (window.__mlImages) delete window.__mlImages[key];
+        if (window.__mlFull) window.__mlFull.delete(key);
+      }
+    }, keys);
+  }
+
+  return { load, trim };
 }
 
 /**
@@ -320,7 +454,8 @@ async function visualDistances(scratchPage, liveEntries, stageEntries) {
         for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) bits.push(gray[y * 9 + x] > gray[y * 9 + x + 1] ? 1 : 0);
         return bits;
       };
-      const full = new Map();
+      window.__mlFull = window.__mlFull || new Map();
+      const full = window.__mlFull;
       const fullHash = (key) => {
         if (!full.has(key)) {
           const canvas = store[key];
@@ -376,13 +511,13 @@ async function visualDistances(scratchPage, liveEntries, stageEntries) {
   );
 }
 
-async function computeVisual({ scratchPage, liveContext, stageContext, live, stage, timeout, threshold }) {
-  await scratchPage.evaluate(() => {
-    window.__mlImages = {};
-  });
-  const liveEntries = await loadIntoScratch(scratchPage, liveContext, "l", uniqueImageUrls(live), timeout);
-  const stageEntries = await loadIntoScratch(scratchPage, stageContext, "s", uniqueImageUrls(stage), timeout);
+async function computeVisual({ scratchPage, imageCache, liveContext, stageContext, live, stage, timeout, threshold }) {
+  const [liveEntries, stageEntries] = await Promise.all([
+    imageCache.load("live", liveContext, uniqueImageUrls(live), timeout),
+    imageCache.load("stage", stageContext, uniqueImageUrls(stage), timeout)
+  ]);
   const { distances, hashes } = await visualDistances(scratchPage, liveEntries, stageEntries);
+  await imageCache.trim(new Set([...liveEntries, ...stageEntries].map((entry) => entry.key).filter(Boolean)));
   const describe = (entry) => ({
     url: entry.url,
     width: entry.width || 0,
@@ -395,6 +530,7 @@ async function computeVisual({ scratchPage, liveContext, stageContext, live, sta
 
 const MAX_ELEMENT_SHOTS = 8;
 const CROP_PADDING = 40;
+const SCREENSHOT_QUALITY = 70;
 
 async function captureElement(page, ref, filePath) {
   if (!ref) return null;
@@ -413,6 +549,8 @@ async function captureElement(page, ref, filePath) {
     if (width < 2 || height < 2) return null;
     await page.screenshot({
       path: filePath,
+      type: "jpeg",
+      quality: SCREENSHOT_QUALITY,
       clip: { x, y, width, height },
       animations: "disabled",
       timeout: 5_000,
@@ -424,29 +562,36 @@ async function captureElement(page, ref, filePath) {
   }
 }
 
-async function capturePageShots({ livePage, stagePage, record, runDir, screenshotDir, slug }) {
+async function capturePageShots({ livePage, stagePage, record, runDir, screenshotDir, slug, fullScreenshots }) {
   const dir = path.join(screenshotDir, slug);
   await mkdir(dir, { recursive: true });
   const relative = (filePath) => (filePath ? path.relative(runDir, filePath).split(path.sep).join("/") : null);
   const fullPage = async (page, name) => {
+    if (!fullScreenshots) return null;
     const filePath = path.join(dir, name);
     return page
-      .screenshot({ path: filePath, fullPage: true, animations: "disabled" })
+      .screenshot({ path: filePath, fullPage: true, animations: "disabled", type: "jpeg", quality: SCREENSHOT_QUALITY })
       .then(() => filePath)
       .catch(() => null);
   };
 
+  const [liveFull, stageFull] = await Promise.all([
+    record.live ? fullPage(livePage, "live-full.jpg") : null,
+    fullPage(stagePage, "stage-full.jpg")
+  ]);
   const shots = {
-    live: relative(record.live ? await fullPage(livePage, "live-full.png") : null),
-    stage: relative(await fullPage(stagePage, "stage-full.png")),
+    live: relative(liveFull),
+    stage: relative(stageFull),
     elements: []
   };
 
   for (const element of record.diff.elements || []) {
     if (shots.elements.length >= MAX_ELEMENT_SHOTS) break;
     const index = String(shots.elements.length + 1).padStart(2, "0");
-    const liveShot = await captureElement(livePage, element.live, path.join(dir, `el-${index}-live.png`));
-    const stageShot = await captureElement(stagePage, element.stage, path.join(dir, `el-${index}-stage.png`));
+    const [liveShot, stageShot] = await Promise.all([
+      captureElement(livePage, element.live, path.join(dir, `el-${index}-live.jpg`)),
+      captureElement(stagePage, element.stage, path.join(dir, `el-${index}-stage.jpg`))
+    ]);
     if (!liveShot && !stageShot) continue;
     shots.elements.push({
       section: element.section,
@@ -456,6 +601,30 @@ async function capturePageShots({ livePage, stagePage, record, runDir, screensho
     });
   }
   return shots;
+}
+
+function pageTypeOf(pageUrl, pressReleasePattern) {
+  let pathname = "";
+  try {
+    pathname = new URL(pageUrl).pathname;
+  } catch {
+    return null;
+  }
+  let pattern;
+  try {
+    pattern = new RegExp(pressReleasePattern, "i");
+  } catch {
+    return pathname.toLowerCase().includes(pressReleasePattern.toLowerCase()) ? "press-release" : null;
+  }
+  return pattern.test(pathname) ? "press-release" : null;
+}
+
+function withoutImages(fingerprint, urlPart) {
+  const needle = urlPart.toLowerCase();
+  return {
+    ...fingerprint,
+    images: (fingerprint.images || []).filter((image) => !String(image.src || "").toLowerCase().includes(needle))
+  };
 }
 
 function looksLikeLogin(pageUrl, loginPath) {
@@ -502,6 +671,33 @@ async function writeJson(filePath, data) {
   await writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
+async function loadResume(resumeDir) {
+  if (!resumeDir) return null;
+  const runDir = path.resolve(repoRoot, resumeDir);
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(path.join(runDir, "manifest.json"), "utf8"));
+  } catch {
+    throw new Error(`COMPARE_RESUME: no manifest.json in ${runDir}`);
+  }
+  return { runDir, manifest };
+}
+
+/** Slugs already written with a verdict other than ERROR; ERROR paths are retried. */
+async function finishedSlugs(byPathDir) {
+  const done = new Set();
+  const files = (await readdir(byPathDir).catch(() => [])).filter((name) => name.endsWith(".json"));
+  for (const name of files) {
+    try {
+      const record = JSON.parse(await readFile(path.join(byPathDir, name), "utf8"));
+      if (record?.diff?.verdict && record.diff.verdict !== "ERROR") done.add(name.replace(/\.json$/, ""));
+    } catch {
+      // Unreadable record: compare the path again.
+    }
+  }
+  return done;
+}
+
 async function main() {
   const auth = stageAuthFromEnv();
   const liveUrl = process.env.LIVE_URL.trim().replace(/\/$/, "");
@@ -510,17 +706,34 @@ async function main() {
   const outputDir = path.resolve(repoRoot, process.env.OUTPUT_DIR || "./reports");
   const timeout = Number(process.env.CRAWL_TIMEOUT_MS) || 30_000;
   const headless = envFlag("PLAYWRIGHT_HEADLESS", true);
-  const paths = [...new Set(await loadPaths(outputDir))];
+  const concurrency = Math.max(1, Math.floor(Number(process.env.COMPARE_CONCURRENCY) || 4));
+  const idleMs = Number(process.env.COMPARE_IDLE_MS) || 5_000;
+  const fullScreenshots = envFlag("COMPARE_FULL_SCREENSHOTS", false);
+  const blockHosts = blockHostsFromEnv();
+  const resume = await loadResume((process.env.COMPARE_RESUME || "").trim());
+
+  const paths = resume?.manifest?.paths?.length
+    ? resume.manifest.paths
+    : [...new Set(await loadPaths(outputDir))];
   if (!paths.length) {
     throw new Error("No paths to compare. Set COMPARE_PATHS or run npm run scrape first.");
   }
 
-  const { date, time } = stamp();
-  const runDir = path.join(outputDir, "content-compare", date, time);
+  let runDir;
+  if (resume) {
+    runDir = resume.runDir;
+  } else {
+    const { date, time } = stamp();
+    runDir = path.join(outputDir, "content-compare", date, time);
+  }
   const byPathDir = path.join(runDir, "by-path");
   const screenshotDir = path.join(runDir, "screenshots");
   await mkdir(byPathDir, { recursive: true });
   await mkdir(screenshotDir, { recursive: true });
+
+  const finished = resume ? await finishedSlugs(byPathDir) : new Set();
+  const todo = paths.filter((pagePath) => !finished.has(pathToSlug(pagePath)));
+  const skipped = paths.length - todo.length;
 
   const manifest = {
     liveUrl,
@@ -531,8 +744,11 @@ async function main() {
     stageDrupalLogin: auth.drupalLogin,
     loginPath: auth.drupalLogin ? loginPath : null,
     paths,
+    concurrency,
+    fullScreenshots,
     authStatus: "pending",
-    startedAt: new Date().toISOString(),
+    startedAt: resume?.manifest?.startedAt || new Date().toISOString(),
+    resumedAt: resume ? [...(resume.manifest.resumedAt || []), new Date().toISOString()] : undefined,
     finishedAt: null
   };
   await writeJson(path.join(runDir, "manifest.json"), manifest);
@@ -548,29 +764,50 @@ async function main() {
     };
   }
   const stageContext = await browser.newContext(stageContextOptions);
-  await enforceReadOnly(liveContext, null);
+  await enforceReadOnly(liveContext, null, blockHosts);
   const allowLoginPost = { current: false, path: loginPath };
-  await enforceReadOnly(stageContext, allowLoginPost);
-  const livePage = await liveContext.newPage();
-  const stagePage = await stageContext.newPage();
+  await enforceReadOnly(stageContext, allowLoginPost, blockHosts);
   const scratchContext = await browser.newContext();
   await scratchContext.route("**/*", (route) => route.abort("blockedbyclient"));
-  const scratchPage = await scratchContext.newPage();
-  await scratchPage.setContent("<!doctype html><title>migralens image hash</title>");
+  const newScratchPage = async () => {
+    const page = await scratchContext.newPage();
+    await page.setContent("<!doctype html><title>migralens image hash</title>");
+    return page;
+  };
+  const workerCount = Math.max(1, Math.min(concurrency, todo.length));
+  const workers = [];
+  for (let i = 0; i < workerCount; i++) {
+    const scratchPage = await newScratchPage();
+    workers.push({
+      livePage: await liveContext.newPage(),
+      stagePage: await stageContext.newPage(),
+      scratchPage,
+      imageCache: createImageCache(scratchPage)
+    });
+  }
   const liveOptions = {
     mainSelector: (process.env.LIVE_MAIN_SELECTOR || "").trim(),
-    popupSelectors: envList("LIVE_POPUP_CLOSE_SELECTORS")
+    headerSelector: (process.env.LIVE_HEADER_SELECTOR || "").trim(),
+    footerSelector: (process.env.LIVE_FOOTER_SELECTOR || "").trim(),
+    popupSelectors: envList("LIVE_POPUP_CLOSE_SELECTORS"),
+    idleMs
   };
   const stageOptions = {
     mainSelector: (process.env.STAGE_MAIN_SELECTOR || "").trim(),
-    popupSelectors: envList("STAGE_POPUP_CLOSE_SELECTORS")
+    headerSelector: (process.env.STAGE_HEADER_SELECTOR || "").trim(),
+    footerSelector: (process.env.STAGE_FOOTER_SELECTOR || "").trim(),
+    popupSelectors: envList("STAGE_POPUP_CLOSE_SELECTORS"),
+    idleMs
   };
   const hashThreshold = Number(process.env.IMAGE_HASH_THRESHOLD) || 10;
+  const pressReleasePattern = (process.env.PRESS_RELEASE_PATH_PATTERN || "press-releases").trim() || "press-releases";
+  const pressReleaseDefaultImage =
+    (process.env.PRESS_RELEASE_DEFAULT_IMAGE || "news-release-banner").trim() || "news-release-banner";
 
   try {
     if (auth.drupalLogin) {
       allowLoginPost.current = true;
-      await loginDrupal(stagePage, stageUrl, loginPath, auth.drupalUser, auth.drupalPass, timeout);
+      await loginDrupal(workers[0].stagePage, stageUrl, loginPath, auth.drupalUser, auth.drupalPass, timeout);
       allowLoginPost.current = false;
     }
     manifest.authStatus = "ok";
@@ -578,18 +815,25 @@ async function main() {
     const basicLabel = auth.basicAuth ? "on" : "off";
     const drupalLabel = auth.drupalLogin ? "on" : "off";
     console.log(
-      `[migralens] Live auth none. Stage basic=${basicLabel}, drupal=${drupalLabel}. Comparing ${paths.length} path(s). Read-only.`
+      `[migralens] Live auth none. Stage basic=${basicLabel}, drupal=${drupalLabel}. Comparing ${todo.length} path(s)` +
+        `${skipped ? ` (${skipped} already done)` : ""} with ${workerCount} worker(s). Read-only.`
     );
+    if (resume) console.log(`[migralens] Resuming ${runDir}`);
 
-    for (const pagePath of paths) {
+    let nextIndex = 0;
+    let completed = skipped;
+    let stopped = false;
+
+    const comparePath = async (worker, pagePath) => {
+      const { livePage, stagePage, scratchPage, imageCache } = worker;
       const liveTarget = joinOrigin(liveUrl, pagePath);
       const stageTarget = joinOrigin(stageUrl, pagePath);
-      const slug = pathToSlug(pagePath);
-      console.log(`[migralens] ${pagePath}`);
       let record;
       try {
-        const live = await openAndExtract(livePage, liveTarget, timeout, extractSource, liveOptions);
-        const stage = await openAndExtract(stagePage, stageTarget, timeout, extractSource, stageOptions);
+        const [live, stage] = await Promise.all([
+          openAndExtract(livePage, liveTarget, timeout, extractSource, liveOptions),
+          openAndExtract(stagePage, stageTarget, timeout, extractSource, stageOptions)
+        ]);
         const stageStatus = stage.response ? stage.response.status() : 0;
         const requestedPath = pathnameOf(pagePath).replace(/\/$/, "") || "/";
         const loginWall = loginPath.replace(/\/$/, "") || "/";
@@ -607,6 +851,8 @@ async function main() {
               imageMatch: "No",
               seoMatch: "No",
               urlMatch: "No",
+              headerMatch: "No",
+              footerMatch: "No",
               comment: stageOnLogin
                 ? "Stage returned the login page"
                 : `Stage returned HTTP ${stageStatus}`,
@@ -615,18 +861,26 @@ async function main() {
             }
           };
         } else {
+          const pageType = pageTypeOf(stagePage.url(), pressReleasePattern);
+          const isPressRelease = pageType === "press-release";
           const visual = await computeVisual({
             scratchPage,
+            imageCache,
             liveContext,
             stageContext,
-            live: live.fingerprint,
-            stage: stage.fingerprint,
+            live: isPressRelease ? withoutImages(live.fingerprint, pressReleaseDefaultImage) : live.fingerprint,
+            stage: isPressRelease ? withoutImages(stage.fingerprint, pressReleaseDefaultImage) : stage.fingerprint,
             timeout,
             threshold: hashThreshold
           });
-          const diff = diffFingerprints(live.fingerprint, stage.fingerprint, { visual });
+          const diff = diffFingerprints(live.fingerprint, stage.fingerprint, {
+            visual,
+            pageType,
+            pressReleaseDefaultImage
+          });
           record = {
             page: pagePath,
+            pageType,
             liveUrl: liveTarget,
             stageUrl: stageTarget,
             live: live.fingerprint,
@@ -646,6 +900,8 @@ async function main() {
             imageMatch: "No",
             seoMatch: "No",
             urlMatch: "No",
+            headerMatch: "No",
+            footerMatch: "No",
             comment: message,
             verdict: "ERROR",
             reasons: [message]
@@ -653,14 +909,39 @@ async function main() {
         };
       }
 
-      if (record.diff.verdict !== "PASS") {
-        record.screenshots = await capturePageShots({ livePage, stagePage, record, runDir, screenshotDir, slug });
+      return record;
+    };
+
+    const runWorker = async (worker) => {
+      while (!stopped && nextIndex < todo.length) {
+        const pagePath = todo[nextIndex++];
+        const slug = pathToSlug(pagePath);
+        const started = Date.now();
+        const record = await comparePath(worker, pagePath);
+        if (record.diff.verdict !== "PASS") {
+          record.screenshots = await capturePageShots({
+            livePage: worker.livePage,
+            stagePage: worker.stagePage,
+            record,
+            runDir,
+            screenshotDir,
+            slug,
+            fullScreenshots
+          }).catch(() => null);
+        }
+        await writeJson(path.join(byPathDir, `${slug}.json`), record);
+        completed++;
+        const seconds = ((Date.now() - started) / 1000).toFixed(1);
+        console.log(`[migralens] [${completed}/${paths.length}] ${pagePath} ${record.diff.verdict} (${seconds}s)`);
+        if (manifest.authStatus === "failed") {
+          stopped = true;
+        }
       }
-      await writeJson(path.join(byPathDir, `${slug}.json`), record);
-      console.log(`[migralens] ${pagePath} ${record.diff.verdict}`);
-      if (manifest.authStatus === "failed") {
-        break;
-      }
+    };
+
+    await Promise.all(workers.map(runWorker));
+    if (manifest.authStatus === "failed") {
+      await writeJson(path.join(runDir, "manifest.json"), manifest);
     }
   } catch (error) {
     allowLoginPost.current = false;
@@ -676,10 +957,12 @@ async function main() {
   const written = (await readdir(byPathDir).catch(() => [])).filter((name) => name.endsWith(".json"));
   if (written.length) {
     const summary = await renderSummary(runDir);
+    await renderDashboard(runDir);
     console.log(
       `[migralens] ${summary.counts.pass} pass, ${summary.counts.fail} fail, ${summary.counts.error} error`
     );
     console.log(`[migralens] ${path.join(runDir, "summary.html")}`);
+    console.log(`[migralens] ${path.join(runDir, "dashboard.html")}`);
     if (summary.counts.fail || summary.counts.error) {
       process.exitCode = 1;
     }

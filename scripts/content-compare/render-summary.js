@@ -15,9 +15,13 @@ const COLUMNS = [
   ["imageMatch", "Image match"],
   ["seoMatch", "SEO Tags match"],
   ["urlMatch", "URL match"],
+  ["headerMatch", "Header match"],
+  ["footerMatch", "Footer match"],
   ["comment", "Comment"],
   ["screenshots", "Screenshots"]
 ];
+
+const NOT_CHECKED = "N/A";
 
 function yesNo(value, fallbackOk) {
   if (value === "Yes" || value === "No") return value;
@@ -42,13 +46,22 @@ function rowFromRecord(data, filename) {
   const imageMatch = yesNo(diff.imageMatch, diff.imagesOk);
   const seoMatch = yesNo(diff.seoMatch, diff.seoOk);
   const urlMatch = yesNo(diff.urlMatch, diff.urlsOk);
-  const allYes = [contentMatch, imageMatch, seoMatch, urlMatch].every((value) => value === "Yes");
+  // Runs from before header/footer compare have neither field; show N/A instead of a false "No".
+  const chromeChecked = "headerMatch" in diff || "headerOk" in diff;
+  const headerMatch = chromeChecked ? yesNo(diff.headerMatch, diff.headerOk) : NOT_CHECKED;
+  const footerMatch = chromeChecked ? yesNo(diff.footerMatch, diff.footerOk) : NOT_CHECKED;
+  const allYes = [contentMatch, imageMatch, seoMatch, urlMatch, headerMatch, footerMatch].every(
+    (value) => value === "Yes" || value === NOT_CHECKED
+  );
   return {
     page: String(page),
+    pageType: data.pageType || diff.pageType || null,
     contentMatch,
     imageMatch,
     seoMatch,
     urlMatch,
+    headerMatch,
+    footerMatch,
     comment,
     screenshots: data.screenshots || null,
     verdict: diff.verdict || data.verdict || (allYes ? "PASS" : "FAIL")
@@ -136,6 +149,7 @@ function renderMarkdown(summary) {
     const cells = COLUMNS.map(([key]) => {
       if (key === "screenshots") return escapeMd(screenshotsMarkdown(row[key]));
       if (key === "comment") return escapeMd(commentMarkdown(row[key]));
+      if (key === "page" && row.pageType) return escapeMd(`${row.page} (${pageTypeLabel(row.pageType)})`);
       return escapeMd(row[key]);
     });
     lines.push(`| ${cells.join(" | ")} |`);
@@ -144,8 +158,12 @@ function renderMarkdown(summary) {
   return lines.join("\n");
 }
 
+function pageTypeLabel(pageType) {
+  return pageType === "press-release" ? "Press release" : pageType;
+}
+
 function matchCell(value) {
-  const kind = value === "Yes" ? "yes" : "no";
+  const kind = value === "Yes" ? "yes" : value === NOT_CHECKED ? "na" : "no";
   return `<td class="${kind}">${escapeHtml(value)}</td>`;
 }
 
@@ -160,7 +178,10 @@ function figure(caption, href, className) {
 
 function screenshotsHtml(shots) {
   if (!shots) return "";
-  const full = `<div class="pair">${figure("Live", shots.live, "full")}${figure("Stage", shots.stage, "full")}</div>`;
+  const full =
+    shots.live || shots.stage
+      ? `<div class="pair">${figure("Live", shots.live, "full")}${figure("Stage", shots.stage, "full")}</div>`
+      : "";
   const elements = shots.elements || [];
   if (!elements.length) return full;
   const items = elements
@@ -174,16 +195,70 @@ function screenshotsHtml(shots) {
   return `${full}<details><summary>${elements.length} differing element${elements.length === 1 ? "" : "s"}</summary>${items}</details>`;
 }
 
+const MATCH_KEYS = ["contentMatch", "imageMatch", "seoMatch", "urlMatch", "headerMatch", "footerMatch"];
+
+function filterBarHtml() {
+  const selects = COLUMNS.filter(([key]) => MATCH_KEYS.includes(key))
+    .map(
+      ([key, label]) => `<label>${escapeHtml(label)}
+        <select data-filter="${key}">
+          <option value="">All</option>
+          <option value="Yes">Yes</option>
+          <option value="No">No</option>
+        </select>
+      </label>`
+    )
+    .join("\n      ");
+  return `<div class="filters">
+      <label>Page
+        <input type="search" data-filter="page" placeholder="Search path" />
+      </label>
+      ${selects}
+      <button type="button" id="filter-reset">Reset</button>
+      <span id="filter-count"></span>
+    </div>`;
+}
+
+const FILTER_SCRIPT = `
+  (() => {
+    const controls = Array.from(document.querySelectorAll("[data-filter]"));
+    const rows = Array.from(document.querySelectorAll("tbody tr"));
+    const count = document.getElementById("filter-count");
+    const apply = () => {
+      const active = controls.map((el) => [el.dataset.filter, el.value.trim().toLowerCase()]).filter(([, value]) => value);
+      let shown = 0;
+      for (const row of rows) {
+        const visible = active.every(([key, value]) =>
+          key === "page" ? row.dataset.page.includes(value) : row.dataset[key.toLowerCase()] === value
+        );
+        row.hidden = !visible;
+        if (visible) shown += 1;
+      }
+      count.textContent = "Showing " + shown + " of " + rows.length + " pages";
+    };
+    controls.forEach((el) => el.addEventListener("input", apply));
+    document.getElementById("filter-reset").addEventListener("click", () => {
+      controls.forEach((el) => (el.value = ""));
+      apply();
+    });
+    apply();
+  })();
+`;
+
 function renderHtml(summary) {
   const head = COLUMNS.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join("");
   const body = summary.rows
     .map((row) => {
-      return `<tr>
-        <td>${escapeHtml(row.page)}</td>
+      const tag = row.pageType ? ` <span class="tag">${escapeHtml(pageTypeLabel(row.pageType))}</span>` : "";
+      const data = MATCH_KEYS.map((key) => `data-${key.toLowerCase()}="${escapeHtml(String(row[key] || "").toLowerCase())}"`).join(" ");
+      return `<tr data-page="${escapeHtml(row.page.toLowerCase())}" ${data}>
+        <td>${escapeHtml(row.page)}${tag}</td>
         ${matchCell(row.contentMatch)}
         ${matchCell(row.imageMatch)}
         ${matchCell(row.seoMatch)}
         ${matchCell(row.urlMatch)}
+        ${matchCell(row.headerMatch)}
+        ${matchCell(row.footerMatch)}
         <td class="comment">${commentHtml(row.comment)}</td>
         <td class="shots">${screenshotsHtml(row.screenshots)}</td>
       </tr>`;
@@ -204,6 +279,8 @@ function renderHtml(summary) {
     th { background: #f5f5f4; font-size: 0.85rem; }
     td.yes { color: #166534; font-weight: 600; }
     td.no { color: #b91c1c; font-weight: 600; }
+    td.na { color: #a8a29e; }
+    .tag { display: inline-block; margin-top: 4px; padding: 1px 6px; border-radius: 9px; background: #e0e7ff; color: #3730a3; font-size: 0.7rem; font-weight: 600; white-space: nowrap; }
     td.comment { min-width: 30rem; max-width: 44rem; font-weight: 400; color: #44403c; font-size: 0.85rem; line-height: 1.4; }
     td.comment .c-section { font-weight: 700; color: #1c1917; margin-top: 12px; font-size: 0.95rem; }
     td.comment .c-section:first-child { margin-top: 0; }
@@ -223,20 +300,34 @@ function renderHtml(summary) {
     summary { cursor: pointer; font-size: 0.85rem; color: #1d4ed8; }
     .element { margin-top: 8px; }
     .element p { margin: 0 0 4px; font-size: 0.8rem; color: #44403c; }
+    .filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin: 12px 0 16px; padding: 12px; background: #fff; border: 1px solid #e7e5e4; border-radius: 6px; position: sticky; top: 0; z-index: 1; }
+    .filters label { display: flex; flex-direction: column; gap: 4px; font-size: 0.75rem; font-weight: 600; color: #57534e; }
+    .filters select, .filters input { font: inherit; font-weight: 400; font-size: 0.85rem; padding: 4px 6px; border: 1px solid #d6d3d1; border-radius: 4px; background: #fff; }
+    .filters input { min-width: 14rem; }
+    .filters button { font: inherit; font-size: 0.85rem; padding: 5px 12px; border: 1px solid #d6d3d1; border-radius: 4px; background: #f5f5f4; cursor: pointer; }
+    #filter-count { font-size: 0.85rem; color: #57534e; margin-left: auto; }
   </style>
 </head>
 <body>
   <h1>Content compare</h1>
   <p>${summary.counts.pass} pass, ${summary.counts.fail} fail, ${summary.counts.error} error (${summary.counts.total} pages). Generated ${escapeHtml(summary.generatedAt)}.</p>
+  ${filterBarHtml()}
   <table>
     <thead><tr>${head}</tr></thead>
     <tbody>
 ${body}
     </tbody>
   </table>
+  <script>${FILTER_SCRIPT}</script>
 </body>
 </html>
 `;
+}
+
+/** Yes count, or null when no row in the run was checked (older runs). */
+function chromeCount(rows, key) {
+  if (rows.every((row) => row[key] === NOT_CHECKED)) return null;
+  return rows.filter((row) => row[key] === "Yes").length;
 }
 
 export async function renderSummary(runDir) {
@@ -267,18 +358,23 @@ export async function renderSummary(runDir) {
     contentMatch: rows.filter((row) => row.contentMatch === "Yes").length,
     imageMatch: rows.filter((row) => row.imageMatch === "Yes").length,
     seoMatch: rows.filter((row) => row.seoMatch === "Yes").length,
-    urlMatch: rows.filter((row) => row.urlMatch === "Yes").length
+    urlMatch: rows.filter((row) => row.urlMatch === "Yes").length,
+    headerMatch: chromeCount(rows, "headerMatch"),
+    footerMatch: chromeCount(rows, "footerMatch")
   };
 
   const summary = {
     generatedAt: new Date().toISOString(),
     counts,
-    rows: rows.map(({ page, contentMatch, imageMatch, seoMatch, urlMatch, comment, screenshots }) => ({
+    rows: rows.map(({ page, pageType, contentMatch, imageMatch, seoMatch, urlMatch, headerMatch, footerMatch, comment, screenshots }) => ({
       page,
+      pageType,
       contentMatch,
       imageMatch,
       seoMatch,
       urlMatch,
+      headerMatch,
+      footerMatch,
       comment,
       screenshots
     }))

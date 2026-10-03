@@ -13,6 +13,7 @@
     "audit:perf": "tsx src/cli/audit-perf.ts",
     "compare": "tsx src/cli/compare.ts",
     "content-compare": "node scripts/content-compare/run.js",
+    "content-compare:dashboard": "node scripts/content-compare/render-dashboard.js",
     "report": "tsx src/cli/report.ts",
     "generate-report": "node scripts/generate-report.js",
     "generate-comparison-report": "node scripts/generate-comparison-report.js",

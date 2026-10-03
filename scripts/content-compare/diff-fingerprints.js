@@ -10,6 +10,10 @@
  * every live block must exist on stage and every stage block on live.
  * Images: visual match by perceptual hash (options.visual from run.js); falls back
  * to asset keys when no hashes are available. SEO and links stay strict.
+ * Header / Footer: site header and footer text (any order) and links (unordered set).
+ * options.pageType "press-release" drops the default banner, read time, share widget,
+ * and Media Contact / About boilerplate from main content, and compares date-only
+ * blocks by calendar day.
  */
 const SEO_FIELDS = [
   ["title", "Title"],
@@ -171,10 +175,128 @@ export function textKey(text) {
 
 function blocksOf(fingerprint) {
   if (Array.isArray(fingerprint.textBlocks)) {
-    return fingerprint.textBlocks.map((block) => ({ ...block, key: textKey(block.text) })).filter((block) => block.key);
+    return fingerprint.textBlocks
+      .map((block) => ({ ...block, key: block.matchKey || textKey(block.text) }))
+      .filter((block) => block.key);
   }
   const text = pageTextOf(fingerprint);
   return text ? [{ tag: "body", text, key: textKey(text), ref: "" }] : [];
+}
+
+const PRESS_IGNORED_HEADINGS = new Set(["media contact", "about save the children"]);
+const READ_TIME = /^\d+\s*min(?:ute)?s?\.?\s*read$/;
+const SHARE_PATH = /\/(?:sharer|sharing|share|intent\/tweet|intent\/post)(?:[/.]|$)/;
+const SHARE_HOST = /(?:^|\.)(?:facebook\.com|twitter\.com|x\.com|linkedin\.com|wa\.me|whatsapp\.com|pinterest\.[a-z.]+|reddit\.com)$/;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** True when the text is only share-widget words ("Share", "Facebook LinkedIn Email", "Copied"). */
+function isShareText(text) {
+  const key = textKey(text);
+  if (!key) return false;
+  const rest = key
+    .replace(/x\s*\(twitter\)/g, " ")
+    .replace(/\b(?:share(?: this(?: page| article| post)?)?|copied|copy link|copy url|facebook|linkedin|e-?mail|twitter|whatsapp|print|pinterest|reddit|messenger|x)\b/g, " ")
+    .replace(/[\s|,.:;!·•\-/]+/g, "");
+  return rest === "";
+}
+
+function isoDate(year, month, day) {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  if (!y || m < 1 || m > 12 || d < 1 || d > 31) return "";
+  return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+function monthNumber(name) {
+  const index = MONTHS.indexOf(String(name || "").slice(0, 3));
+  return index === -1 ? 0 : index + 1;
+}
+
+/** "03/22/2016", "22 Mar 2016", "March 22, 2016", "2016-03-22" → "date:2016-03-22"; anything else → "". */
+export function dateKey(text) {
+  const key = textKey(text).replace(/\.(?=\s|,|$)/g, "");
+  let match = key.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  let iso = "";
+  if (match) iso = isoDate(match[3], match[1], match[2]);
+  else if ((match = key.match(/^(\d{1,2})\s+([a-z]{3,9})\s*,?\s*(\d{4})$/))) iso = isoDate(match[3], monthNumber(match[2]), match[1]);
+  else if ((match = key.match(/^([a-z]{3,9})\s+(\d{1,2})\s*,?\s*(\d{4})$/))) iso = isoDate(match[3], monthNumber(match[1]), match[2]);
+  else if ((match = key.match(/^(\d{4})-(\d{2})-(\d{2})$/))) iso = isoDate(match[1], match[2], match[3]);
+  return iso ? `date:${iso}` : "";
+}
+
+function underIgnoredHeading(entry) {
+  return PRESS_IGNORED_HEADINGS.has(textKey(entry.underHeading));
+}
+
+function emptyIgnored() {
+  return { readTime: [], share: [], contact: [], shareLinks: [], contactLinks: [], images: [], dates: [] };
+}
+
+/**
+ * Press releases on stage add a default banner, a read-time line, and a share widget,
+ * and drop the Media Contact / About boilerplate; none of that is article content.
+ */
+function pressReleaseFilter(fingerprint, defaultImage) {
+  const ignored = emptyIgnored();
+  const textBlocks = [];
+  for (const block of fingerprint.textBlocks || []) {
+    const key = textKey(block.text);
+    if (READ_TIME.test(key)) ignored.readTime.push(block.text);
+    else if (isShareText(block.text)) ignored.share.push(block.text);
+    else if (key.startsWith("media contact:") || underIgnoredHeading(block)) ignored.contact.push(block.text);
+    else {
+      const date = dateKey(block.text);
+      if (date) ignored.dates.push(`${block.text} → ${date.slice(5)}`);
+      textBlocks.push(date ? { ...block, matchKey: date } : block);
+    }
+  }
+  const contactKeys = ignored.contact.map(textKey);
+  const insideContact = (link) => {
+    const key = textKey(link.text);
+    return Boolean(key) && contactKeys.some((contact) => contact.includes(key));
+  };
+  const links = [];
+  for (const link of fingerprint.links || []) {
+    const pathname = String(link.pathname || "");
+    const share =
+      isShareText(link.text) || SHARE_PATH.test(pathname) || SHARE_HOST.test(link.host || "") || /^mailto:\?/i.test(pathname);
+    if (share) ignored.shareLinks.push(linkLabel(link));
+    else if (underIgnoredHeading(link) || insideContact(link)) ignored.contactLinks.push(linkLabel(link));
+    else links.push(link);
+  }
+  const needle = String(defaultImage || "").toLowerCase();
+  const images = [];
+  for (const image of fingerprint.images || []) {
+    if (needle && String(image.src || "").toLowerCase().includes(needle)) ignored.images.push(imageKey(image));
+    else images.push(image);
+  }
+  return { fingerprint: { ...fingerprint, textBlocks, links, images }, ignored };
+}
+
+function pressReleaseNotes(ignoredBySide) {
+  const lines = [];
+  const groups = [
+    ["readTime", "Read time"],
+    ["share", "Share widget text"],
+    ["contact", "Media Contact / About Save the Children text"],
+    ["shareLinks", "Share links"],
+    ["contactLinks", "Media Contact / About links"],
+    ["images", "Default press release image"]
+  ];
+  for (const [side, ignored] of ignoredBySide) {
+    for (const [key, label] of groups) {
+      const items = ignored[key];
+      if (!items.length) continue;
+      lines.push(`- Press release: ignored on ${side} – ${label} (${num(items.length)})`);
+      lines.push(...itemLines(items.map((entry) => clip(entry, 120)), "item", "items"));
+    }
+    if (ignored.dates.length) {
+      lines.push(`- Press release: dates compared by calendar day on ${side} (${num(ignored.dates.length)})`);
+      lines.push(...itemLines(ignored.dates, "date", "dates"));
+    }
+  }
+  return lines;
 }
 
 /** Unique blocks from `blocks` whose text is not contained anywhere in `otherText`. */
@@ -194,8 +316,10 @@ function blockLabel(block) {
 }
 
 function compareContent(live, stage) {
-  const liveBlocks = blocksOf(live);
-  const stageBlocks = blocksOf(stage);
+  return compareBlocks(blocksOf(live), blocksOf(stage), "Content");
+}
+
+function compareBlocks(liveBlocks, stageBlocks, section) {
   const liveText = textKey(liveBlocks.map((block) => block.key).join(" "));
   const stageText = textKey(stageBlocks.map((block) => block.key).join(" "));
   const missing = blocksMissingFrom(liveBlocks, stageText);
@@ -216,7 +340,7 @@ function compareContent(live, stage) {
     stageRefs: extra.map((block) => block.ref || "")
   };
   const elements = pairElements(
-    "Content",
+    section,
     list,
     missing.map((_, i) => i),
     extra.map((_, i) => i)
@@ -462,12 +586,74 @@ function compareLinks(live, stage) {
   return { ok, lines: described.lines, elements: described.elements };
 }
 
+/** Unique labels in `a` not present in `b`, as indices into `a` (first occurrence). */
+function uniqueMissingFrom(a, b) {
+  const other = new Set(b);
+  const seen = new Set();
+  const missing = [];
+  a.forEach((entry, index) => {
+    if (seen.has(entry)) return;
+    seen.add(entry);
+    if (!other.has(entry)) missing.push(index);
+  });
+  return missing;
+}
+
+/** Site header or footer: text any order both ways, links as an unordered set of text and path. */
+function compareChrome(liveChrome, stageChrome, section) {
+  const key = section.toLowerCase();
+  const missingSides = [["Live", liveChrome], ["Stage", stageChrome]]
+    .filter(([, chrome]) => !chrome || !chrome.selectorUsed)
+    .map(([side]) => side);
+  if (missingSides.length) {
+    return {
+      ok: false,
+      lines: [`- ${section} not found on ${missingSides.join(" and ")}. Set ${missingSides.map((side) => `${side.toUpperCase()}_${section.toUpperCase()}_SELECTOR`).join(" / ")}.`],
+      elements: [],
+      details: {}
+    };
+  }
+
+  const text = compareBlocks(blocksOf(liveChrome), blocksOf(stageChrome), section);
+  const linkList = listOf(liveChrome.links || [], stageChrome.links || [], (link) => linkLabel(link).toLowerCase());
+  const missing = uniqueMissingFrom(linkList.liveItems, linkList.stageItems);
+  const extra = uniqueMissingFrom(linkList.stageItems, linkList.liveItems);
+  const lines = [...text.lines];
+  if (missing.length) {
+    lines.push(`- Links missing on Stage (${num(missing.length)}): ${section} links on Live not found on Stage.`);
+    lines.push(...itemLines(missing.map((i) => linkLabel(liveChrome.links[i])), "link", "links"));
+  }
+  if (extra.length) {
+    lines.push(`- Links only on Stage (${num(extra.length)}): ${section} links on Stage not found on Live.`);
+    lines.push(...itemLines(extra.map((i) => linkLabel(stageChrome.links[i])), "link", "links"));
+  }
+  return {
+    ok: text.ok && !missing.length && !extra.length,
+    lines,
+    elements: [...text.elements, ...pairElements(section, linkList, missing, extra)],
+    details: {
+      [`${key}TextMissingOnStage`]: text.details.textMissingOnStage,
+      [`${key}TextOnlyOnStage`]: text.details.textOnlyOnStage,
+      [`${key}LinksMissingOnStage`]: missing.map((i) => linkLabel(liveChrome.links[i])),
+      [`${key}LinksOnlyOnStage`]: extra.map((i) => linkLabel(stageChrome.links[i]))
+    }
+  };
+}
+
 const MIN_MAIN_TEXT = 50;
 
-function notesLines(live, stage) {
+function notesLines(live, stage, extraLines = []) {
   const scope = (fingerprint) =>
     `${fingerprint.mainSelectorUsed || "body"}${fingerprint.mainSelectorMissing ? " (configured selector not found)" : ""}`;
-  const lines = ["Notes", `- Scope: Live – ${scope(live)} | Stage – ${scope(stage)}`];
+  const chromeScope = (chrome) =>
+    chrome?.selectorUsed ? `${chrome.selectorUsed}${chrome.selectorMissing ? " (configured selector not found)" : ""}` : "not found";
+  const lines = [
+    "Notes",
+    `- Scope: Live – ${scope(live)} | Stage – ${scope(stage)}`,
+    `- Header: Live – ${chromeScope(live.header)} | Stage – ${chromeScope(stage.header)}`,
+    `- Footer: Live – ${chromeScope(live.footer)} | Stage – ${chromeScope(stage.footer)}`,
+    ...extraLines
+  ];
   for (const [side, fingerprint] of [["Live", live], ["Stage", stage]]) {
     if (fingerprint.popupsClosed?.length) {
       lines.push(`- Popups closed on ${side} (${num(fingerprint.popupsClosed.length)})`);
@@ -489,21 +675,43 @@ export function diffFingerprints(live, stage, options = {}) {
       imagesOk: false,
       seoOk: false,
       urlsOk: false,
+      headerOk: false,
+      footerOk: false,
       contentMatch: "No",
       imageMatch: "No",
       seoMatch: "No",
       urlMatch: "No",
+      headerMatch: "No",
+      footerMatch: "No",
       comment,
       verdict: "ERROR",
       reasons: [comment]
     };
   }
 
+  const pageType = options.pageType || null;
+  let liveMain = live;
+  let stageMain = stage;
+  const extraNotes = [];
+  if (pageType === "press-release") {
+    const defaultImage = options.pressReleaseDefaultImage || "news-release-banner";
+    const liveFiltered = pressReleaseFilter(live, defaultImage);
+    const stageFiltered = pressReleaseFilter(stage, defaultImage);
+    liveMain = liveFiltered.fingerprint;
+    stageMain = stageFiltered.fingerprint;
+    extraNotes.push(
+      "- Page type: press release (default image, read time, share widget, Media Contact and About Save the Children ignored)",
+      ...pressReleaseNotes([["Live", liveFiltered.ignored], ["Stage", stageFiltered.ignored]])
+    );
+  }
+
   const sections = [
-    ["Content", compareContent(live, stage)],
-    ["Images", compareImages(live, stage, options.visual)],
+    ["Content", compareContent(liveMain, stageMain)],
+    ["Images", compareImages(liveMain, stageMain, options.visual)],
     ["SEO", compareSeo(live, stage)],
-    ["Links", compareLinks(live, stage)]
+    ["Links", compareLinks(liveMain, stageMain)],
+    ["Header", compareChrome(live.header, stage.header, "Header")],
+    ["Footer", compareChrome(live.footer, stage.footer, "Footer")]
   ];
 
   const tooShort = [["live", live], ["stage", stage]]
@@ -521,8 +729,8 @@ export function diffFingerprints(live, stage, options = {}) {
     elements.push(...result.elements.filter((element) => element.live || element.stage));
   }
 
-  const [content, images, seo, links] = sections.map(([, result]) => result.ok);
-  let verdict = content && images && seo && links ? "PASS" : "FAIL";
+  const [content, images, seo, links, header, footer] = sections.map(([, result]) => result.ok);
+  let verdict = content && images && seo && links && header && footer ? "PASS" : "FAIL";
   if (tooShort.length) {
     verdict = "ERROR";
     const message = `Main content not found or nearly empty on ${tooShort.join(" and ")} (under ${MIN_MAIN_TEXT} characters). Set LIVE_MAIN_SELECTOR / STAGE_MAIN_SELECTOR.`;
@@ -530,17 +738,22 @@ export function diffFingerprints(live, stage, options = {}) {
     blocks.unshift(message);
   }
   if (verdict === "PASS") blocks.unshift("All checks match.");
-  blocks.push(notesLines(live, stage).join("\n"));
+  blocks.push(notesLines(live, stage, extraNotes).join("\n"));
 
   return {
+    pageType,
     contentOk: content,
     imagesOk: images,
     seoOk: seo,
     urlsOk: links,
+    headerOk: header,
+    footerOk: footer,
     contentMatch: yesNo(content),
     imageMatch: yesNo(images),
     seoMatch: yesNo(seo),
     urlMatch: yesNo(links),
+    headerMatch: yesNo(header),
+    footerMatch: yesNo(footer),
     comment: blocks.join("\n\n"),
     verdict,
     reasons,

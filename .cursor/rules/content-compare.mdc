@@ -21,7 +21,7 @@ Do **not** edit any content. Use read-only access only.
 
 ## Preconditions
 
-1. Read `.env` for `LIVE_URL`, `STAGE_URL`, `STAGE_BASIC_AUTH`, `STAGE_BASIC_USER`, `STAGE_BASIC_PASS`, `STAGE_DRUPAL_LOGIN`, `STAGE_LOGIN_PATH` (default `/member/login`), `STAGE_DRUPAL_USER`, `STAGE_DRUPAL_PASS`, `COMPARE_PATHS`, and optional `LIVE_MAIN_SELECTOR`, `STAGE_MAIN_SELECTOR`, `LIVE_POPUP_CLOSE_SELECTORS`, `STAGE_POPUP_CLOSE_SELECTORS`, `IMAGE_HASH_THRESHOLD`.
+1. Read `.env` for `LIVE_URL`, `STAGE_URL`, `STAGE_BASIC_AUTH`, `STAGE_BASIC_USER`, `STAGE_BASIC_PASS`, `STAGE_DRUPAL_LOGIN`, `STAGE_LOGIN_PATH` (default `/member/login`), `STAGE_DRUPAL_USER`, `STAGE_DRUPAL_PASS`, `COMPARE_PATHS`, and optional `LIVE_MAIN_SELECTOR`, `STAGE_MAIN_SELECTOR`, `LIVE_HEADER_SELECTOR`, `STAGE_HEADER_SELECTOR`, `LIVE_FOOTER_SELECTOR`, `STAGE_FOOTER_SELECTOR`, `LIVE_POPUP_CLOSE_SELECTORS`, `STAGE_POPUP_CLOSE_SELECTORS`, `IMAGE_HASH_THRESHOLD`, `PRESS_RELEASE_PATH_PATTERN` (default `press-releases`), `PRESS_RELEASE_DEFAULT_IMAGE` (default `news-release-banner`).
 2. Never echo passwords or basic-auth credentials in chat, reports, or screenshots of filled forms.
 3. `LIVE_URL` and `STAGE_URL` are required. Live never needs credentials. Require `STAGE_BASIC_USER` / `STAGE_BASIC_PASS` only when `STAGE_BASIC_AUTH=true`. Require `STAGE_DRUPAL_USER` / `STAGE_DRUPAL_PASS` only when `STAGE_DRUPAL_LOGIN=true`. If a required value is missing, stop and ask the user to fill `.env`. Do not invent hosts or passwords.
 4. Use the project Playwright MCP (`project-0-MigraLens-playwright` / `playwright`). Prefer two tabs: one live, one stage.
@@ -32,6 +32,14 @@ Do **not** edit any content. Use read-only access only.
 - Else: read `reports/url/urls-flat.json`, take pathnames only, remap onto `LIVE_URL` and `STAGE_URL`.
 - Pair by path only: `{LIVE_URL}{path}` ↔ `{STAGE_URL}{path}`.
 - Process 5–10 paths per turn; write progress so the run is resumable.
+
+## Speed and resume (`run.js`)
+
+- `COMPARE_CONCURRENCY` (default 4) workers compare paths in parallel. They share one live context and one stage context, so the Drupal login runs once. Each worker loads live and stage at the same time.
+- `COMPARE_IDLE_MS` (default 5000) caps the network-idle wait after each load.
+- `COMPARE_BLOCK_HOSTS` aborts non-image requests to analytics, ad, and video-embed hosts (empty = built-in list, `none` = off). Consent and popup scripts are never blocked, and images are never blocked.
+- Decoded images are cached per worker by side + URL, so repeated images (logos, shared banners) are fetched and hashed once.
+- `COMPARE_RESUME=reports/content-compare/{date}/{time}` finishes an earlier run in the same folder. Paths with a `by-path` record are skipped, except `ERROR` records, which are compared again.
 
 ## Stage auth (once per session, only enabled layers)
 
@@ -60,7 +68,7 @@ For each path:
 4. Open stage URL (authenticated tab) → same steps.
 5. Diff strictly (rules below).
 6. Write `by-path/{slug}.json` immediately.
-7. On FAIL: `browser_take_screenshot` into `screenshots/` for evidence.
+7. On FAIL: save element crops of the differences into `screenshots/` for evidence. Full-page shots only when `COMPARE_FULL_SCREENSHOTS=true`.
 
 ### Popups (close before compare)
 
@@ -77,13 +85,13 @@ Stage is viewed logged in, so it carries Drupal admin UI: toolbar, View/Edit/Del
 
 ### Fingerprint extract
 
-Use MCP `browser_evaluate` with the function in [`scripts/content-compare/extract-fingerprint.js`](scripts/content-compare/extract-fingerprint.js) (optionally call it with `{ mainSelector }`). It returns main-content `textBlocks`, `headings`, `pageText`, `links`, `images` (real source resolved from lazy attributes, plus CSS backgrounds), `seo`, `mainSelectorUsed`, and `excludedPopups`.
+Use MCP `browser_evaluate` with the function in [`scripts/content-compare/extract-fingerprint.js`](scripts/content-compare/extract-fingerprint.js) (optionally call it with `{ mainSelector, headerSelector, footerSelector }`). It returns main-content `textBlocks`, `headings`, `pageText`, `links`, `images` (real source resolved from lazy attributes, plus CSS backgrounds), `seo`, `mainSelectorUsed`, `excludedPopups`, and `header` / `footer` (`selectorUsed`, `textBlocks`, `links`). Each text block and link carries `underHeading`, the nearest heading before it.
 
-Diff with `diffFingerprints(live, stage, { visual })` from [`scripts/content-compare/diff-fingerprints.js`](scripts/content-compare/diff-fingerprints.js). `visual` comes from `computeVisual()` in `run.js`. Without it, images fall back to asset-key comparison, which is not a valid image PASS for this migration, so prefer `npm run content-compare`.
+Diff with `diffFingerprints(live, stage, { visual, pageType })` from [`scripts/content-compare/diff-fingerprints.js`](scripts/content-compare/diff-fingerprints.js). `visual` comes from `computeVisual()` in `run.js`. Without it, images fall back to asset-key comparison, which is not a valid image PASS for this migration, so prefer `npm run content-compare`.
 
 ### Scope: main content only
 
-Text, headings, images, and links come from the main-content root. That root is `LIVE_MAIN_SELECTOR` / `STAGE_MAIN_SELECTOR`, else the first of `main`, `[role=main]`, `#main-content`, `#main`, `.site-main`, `#content`, else body without header, nav, footer, and aside. The site header, navigation, and footer are out of scope. SEO comes from `<head>`. If either side has under 50 characters of main text, the page is `ERROR`, not `PASS`.
+Text, headings, images, and links come from the main-content root. That root is `LIVE_MAIN_SELECTOR` / `STAGE_MAIN_SELECTOR`, else the first of `main`, `[role=main]`, `#main-content`, `#main`, `.site-main`, `#content`, else body without header, nav, footer, and aside. The site header and footer are compared separately (see Header and footer pass rules). Breadcrumbs are excluded everywhere. SEO comes from `<head>`. If either side has under 50 characters of main text, the page is `ERROR`, not `PASS`.
 
 ### Content pass rules (strict, text only)
 
@@ -114,15 +122,33 @@ Compare `seo` after whitespace normalize. Canonical path and `og:image` asset ke
 
 Compare ordered in-page links (`pathname` + link text) from the main-content root. `http(s)` and relative links use pathname only, so hosts are ignored. `mailto:` and `tel:` keep the raw href.
 
+### Header and footer pass rules (strict)
+
+- Header root: `LIVE_HEADER_SELECTOR` / `STAGE_HEADER_SELECTOR`, else the first outermost `header` / `[role=banner]` outside main, plus following siblings whose class contains `header`. Footer root: `LIVE_FOOTER_SELECTOR` / `STAGE_FOOTER_SELECTOR`, else the last outermost `footer` / `[role=contentinfo]`, plus preceding siblings whose class contains `footer` (the Drupal theme splits the footer into `.footer__main--wrapper` and `footer.footer`). A configured selector may match several elements; all are used.
+- Text uses the content rules (normalized, any order, both directions). Links are an unordered set of link text + pathname (duplicates such as desktop and mobile menus count once). Images are not compared.
+- A header or footer that is not found on either side → No.
+
+### Press release rules
+
+A page is a press release when the stage final URL matches `PRESS_RELEASE_PATH_PATTERN` (default `press-releases`, for example `/about-us/media-and-news/2026-press-releases/...`). Stage redirects the live `/article/...` URL there. For press releases only, main content ignores:
+
+- The default stage banner image (URL contains `PRESS_RELEASE_DEFAULT_IMAGE`, default `news-release-banner`). It is not hashed.
+- The "X min read" line.
+- Share widget text ("Share", "Facebook LinkedIn Email", "Copied", …) and share links (sharer / intent / sharing paths, social share hosts, `mailto:?subject=`).
+- The Media Contact and About Save the Children sections (headings, text, and their `tel:` / `mailto:` links) and stage's "Media Contact: …" line.
+
+Date-only blocks are compared by calendar day (`03/22/2016` = `22 Mar 2016`). Every ignored item is listed in the comment Notes. SEO and header/footer rules do not change.
+
 ## Verdicts
 
-Per path: `PASS` only when content, image, SEO, and URL are all Yes. Otherwise `FAIL`. `ERROR` when a fingerprint is missing. Do not mark `PASS` if stage returned login or 403.
+Per path: `PASS` only when content, image, SEO, URL, header, and footer are all Yes. Otherwise `FAIL`. `ERROR` when a fingerprint is missing. Do not mark `PASS` if stage returned login or 403.
 
 `by-path/{slug}.json` shape:
 
 ```json
 {
   "page": "/about",
+  "pageType": null,
   "liveUrl": "https://live.example/about",
   "stageUrl": "https://stage.example/about",
   "live": {},
@@ -132,6 +158,8 @@ Per path: `PASS` only when content, image, SEO, and URL are all Yes. Otherwise `
     "imageMatch": "No",
     "seoMatch": "Yes",
     "urlMatch": "Yes",
+    "headerMatch": "Yes",
+    "footerMatch": "Yes",
     "comment": "image[0] alt differs",
     "verdict": "FAIL"
   }
@@ -145,11 +173,12 @@ Write under `reports/content-compare/{YYYY-MM-DD}/{HHmmss}/`:
 | File | Purpose |
 |------|---------|
 | `manifest.json` | hosts, paths, authStatus, started/finished |
-| `by-path/{slug}.json` | fingerprints, `visual` (image hashes + distance matrix), diff (four Yes/No columns, structured comment (numbered sections such as "1. Images", "- " sub-headings with Live/Stage lines, up to 5 items then "N more", and a Notes section for scope and closed popups), full `details` lists, verdict) |
+| `by-path/{slug}.json` | fingerprints, `pageType`, `visual` (image hashes + distance matrix), diff (six Yes/No columns, structured comment (numbered sections such as "1. Images", "- " sub-headings with Live/Stage lines, up to 5 items then "N more", and a Notes section for scope and closed popups), full `details` lists, verdict) |
 | `summary.json` | rows plus pass/fail counts |
-| `summary.md` | markdown table: Page, Content match, Image match, SEO Tags match, URL match, Comment, Screenshots |
-| `summary.html` | same table, Yes/No colored, live/stage screenshot thumbnails |
-| `screenshots/{slug}/` | FAIL evidence only: `live-full.png`, `stage-full.png`, and up to 8 `el-NN-live.png` / `el-NN-stage.png` crops of differing text blocks, images, and links (element outlined in red) |
+| `summary.md` | markdown table: Page, Content match, Image match, SEO Tags match, URL match, Header match, Footer match, Comment, Screenshots |
+| `summary.html` | same table, Yes/No colored, "Press release" tag on the page, live/stage screenshot thumbnails |
+| `dashboard.html` | count cards for total pages and each match column |
+| `screenshots/{slug}/` | FAIL evidence only (JPEG): up to 8 `el-NN-live.jpg` / `el-NN-stage.jpg` crops of differing text blocks, images, and links (element outlined in red), plus `live-full.jpg` / `stage-full.jpg` when `COMPARE_FULL_SCREENSHOTS=true` |
 
 ## After the batch
 
