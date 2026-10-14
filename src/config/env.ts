@@ -1,5 +1,6 @@
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
+import type { LighthouseDevice } from "../types.js";
 
 loadDotenv();
 
@@ -47,11 +48,13 @@ const envSchema = z.object({
   MAX_CRAWL_DEPTH: optionalNumber.pipe(z.number().int().min(0).default(3)),
   MAX_URLS: optionalNumber.pipe(z.number().int().positive().optional()),
   PLAYWRIGHT_HEADLESS: booleanFromEnv.pipe(z.boolean().default(true)),
-  /** Lab engine: local Lighthouse MCP, or Google PageSpeed Insights API. */
+  /** Lab engine: local Lighthouse, or Google PageSpeed Insights API. */
   PERF_PROVIDER: z.preprocess(
     emptyToUndefined,
     z.enum(["lighthouse", "pagespeed"]).default("lighthouse")
   ),
+  /** With PERF_PROVIDER=lighthouse: cli = full local Lighthouse (a11y audits + official reports), mcp = Lighthouse MCP (scores only). */
+  LIGHTHOUSE_ENGINE: z.preprocess(emptyToUndefined, z.enum(["cli", "mcp"]).default("cli")),
   LIGHTHOUSE_MCP_CMD: z.preprocess(
     emptyToUndefined,
     z.string().min(1).default("npx -y lighthouse-mcp")
@@ -73,8 +76,11 @@ const envSchema = z.object({
   RETRY_BASE_DELAY_MS: optionalNumber.pipe(z.number().int().positive().default(1_500)),
   USER_AGENT: z.preprocess(emptyToUndefined, z.string().optional()),
   LIGHTHOUSE_MCP_TOOL: z.preprocess(emptyToUndefined, z.string().min(1).default("run_audit")),
-  LIGHTHOUSE_DEVICE: z.preprocess(emptyToUndefined, z.enum(["mobile", "desktop"]).default("desktop")),
   LIGHTHOUSE_THROTTLING: booleanFromEnv.pipe(z.boolean().default(true)),
+  /** Primary device: default toggle in the summary and the copy kept at lighthouse/consolidated.json. */
+  LIGHTHOUSE_DEVICE: z.preprocess(emptyToUndefined, z.enum(["mobile", "desktop"]).default("desktop")),
+  /** Comma-separated devices audited per URL (mobile, desktop). */
+  LIGHTHOUSE_DEVICES: z.preprocess(emptyToUndefined, z.string().default("mobile,desktop")),
   LIGHTHOUSE_CATEGORIES: z.string().default("performance,accessibility,best-practices,seo"),
   COMPARE_FROM: z.preprocess(emptyToUndefined, z.string().optional()),
   COMPARE_TO: z.preprocess(emptyToUndefined, z.string().optional()),
@@ -83,6 +89,7 @@ const envSchema = z.object({
 
 export type AppConfig = z.infer<typeof envSchema> & {
   lighthouseCategories: string[];
+  lighthouseDevices: LighthouseDevice[];
 };
 
 let cached: AppConfig | undefined;
@@ -110,9 +117,23 @@ export function loadConfig(): AppConfig {
     .map((item) => item.trim())
     .filter(Boolean);
 
+  const lighthouseDevices = [
+    ...new Set(
+      parsed.data.LIGHTHOUSE_DEVICES.split(",")
+        .map((item) => item.trim().toLowerCase())
+        .filter((item): item is LighthouseDevice => item === "mobile" || item === "desktop")
+    )
+  ];
+  if (lighthouseDevices.length === 0) {
+    throw new Error(
+      `Invalid environment configuration:\n  - LIGHTHOUSE_DEVICES: expected mobile and/or desktop, received "${parsed.data.LIGHTHOUSE_DEVICES}"`
+    );
+  }
+
   cached = {
     ...parsed.data,
-    lighthouseCategories
+    lighthouseCategories,
+    lighthouseDevices
   };
   return cached;
 }

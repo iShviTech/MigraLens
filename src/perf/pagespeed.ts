@@ -1,59 +1,72 @@
 import type { AppConfig } from "../config/env.js";
-import type { LighthousePageReport } from "../types.js";
+import type { LighthouseDevice, PerfAuditResult } from "../types.js";
 import { categoryForUrl } from "../crawler/categorize.js";
 import { logWarn } from "../utils/logger.js";
 import { withRetry } from "../utils/retry.js";
 import {
+  extractA11yAudits,
   extractCoreWebVitals,
   extractFieldMetrics,
-  extractScores
+  extractScores,
+  lhrStub,
+  unwrapLhr
 } from "./extract.js";
 
 const PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 
 export async function auditUrlWithPageSpeed(
   config: AppConfig,
-  url: string
-): Promise<LighthousePageReport> {
+  url: string,
+  device: LighthouseDevice = config.LIGHTHOUSE_DEVICE
+): Promise<PerfAuditResult> {
   const apiKey = config.PAGESPEED_API_KEY?.trim();
   if (!apiKey) {
-    throw new Error("PAGESPEED_API_KEY is required when PERF_PROVIDER=pagespeed");
+    throw new Error(
+      "PAGESPEED_API_KEY is required when PERF_PROVIDER=pagespeed. Create a key in Google Cloud Console and enable the PageSpeed Insights API."
+    );
   }
 
-  const payload = await withRetry(() => fetchPageSpeed(config, url, apiKey), {
+  const payload = await withRetry(() => fetchPageSpeed(config, url, apiKey, device), {
     attempts: config.RETRY_ATTEMPTS,
     baseDelayMs: config.RETRY_BASE_DELAY_MS,
-    label: `pagespeed:${url}`,
+    label: `pagespeed:${device}:${url}`,
     onRetry: (error, attempt) => {
       logWarn("PageSpeed Insights retry", {
         url,
+        device,
         attempt,
         error: error instanceof Error ? error.message : String(error)
       });
     }
   });
 
+  const lhr = unwrapLhr(payload);
   return {
-    url,
-    category: categoryForUrl(url),
-    scannedAt: new Date().toISOString(),
-    device: config.LIGHTHOUSE_DEVICE,
-    provider: "pagespeed",
-    scores: extractScores(payload),
-    coreWebVitals: extractCoreWebVitals(payload),
-    fieldMetrics: extractFieldMetrics(payload),
-    raw: payload
+    report: {
+      url,
+      category: categoryForUrl(url),
+      scannedAt: new Date().toISOString(),
+      device,
+      provider: "pagespeed",
+      scores: extractScores(payload),
+      coreWebVitals: extractCoreWebVitals(payload),
+      fieldMetrics: extractFieldMetrics(payload),
+      a11yAudits: extractA11yAudits(payload),
+      raw: lhrStub(payload)
+    },
+    lhr
   };
 }
 
 async function fetchPageSpeed(
   config: AppConfig,
   url: string,
-  apiKey: string
+  apiKey: string,
+  device: LighthouseDevice
 ): Promise<unknown> {
   const params = new URLSearchParams({
     url,
-    strategy: config.LIGHTHOUSE_DEVICE === "mobile" ? "mobile" : "desktop",
+    strategy: device,
     key: apiKey
   });
   for (const category of config.lighthouseCategories) {

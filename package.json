@@ -14,6 +14,7 @@
     "compare": "tsx src/cli/compare.ts",
     "content-compare": "node scripts/content-compare/run.js",
     "content-compare:dashboard": "node scripts/content-compare/render-dashboard.js",
+    "content-compare:analyze": "node scripts/content-compare/analyze.js",
     "report": "tsx src/cli/report.ts",
     "generate-report": "node scripts/generate-report.js",
     "generate-comparison-report": "node scripts/generate-comparison-report.js",
@@ -35,6 +36,7 @@
     "@axe-core/playwright": "^4.13.0",
     "@modelcontextprotocol/sdk": "^1.17.4",
     "dotenv": "^16.4.7",
+    "lighthouse": "^12.8.2",
     "p-limit": "^6.2.0",
     "playwright": "^1.51.1",
     "zod": "^3.24.2"

@@ -7,7 +7,8 @@
  * Live is always public (no credentials). Stage HTTP Basic Auth and Drupal login
  * run only when STAGE_BASIC_AUTH / STAGE_DRUPAL_LOGIN are true.
  * The only allowed POST is the Drupal login form, and only while that flag is true.
- * Writes reports/content-compare/{YYYY-MM-DD}/{HHmmss}/ including summary.html and dashboard.html.
+ * Writes reports/content-compare/{YYYY-MM-DD}/{HHmmss}/ including summary.html, issues.html, and dashboard.html
+ * (via analyze.js, which also runs the optional AI review).
  * Speed knobs: COMPARE_CONCURRENCY, COMPARE_IDLE_MS, COMPARE_BLOCK_HOSTS, COMPARE_FULL_SCREENSHOTS,
  * and COMPARE_RESUME (an existing run folder to finish).
  */
@@ -16,9 +17,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as loadDotenv } from "dotenv";
 import { chromium } from "playwright";
-import { diffFingerprints, pathToSlug } from "./diff-fingerprints.js";
-import { renderDashboard } from "./render-dashboard.js";
-import { renderSummary } from "./render-summary.js";
+import { analyzeRun } from "./analyze.js";
+import { CHROME_NOT_CHECKED, chromeConfigFromEnv, diffFingerprints, pathToSlug, redirectConfigFromEnv } from "./diff-fingerprints.js";
 
 loadDotenv();
 
@@ -310,7 +310,80 @@ async function openAndExtract(
     { code: extractSource, options: { mainSelector, headerSelector, footerSelector } }
   );
   fingerprint.popupsClosed = popupsClosed;
-  return { response, fingerprint };
+  const redirect = await redirectChain(url, response, fingerprint.url || page.url());
+  return { response, fingerprint, redirect };
+}
+
+function withoutHash(value) {
+  return String(value || "").split("#")[0];
+}
+
+/** Server hops (status per hop), the final response, and any client-side (JS / meta refresh) move after load. */
+async function redirectChain(requestedUrl, response, pageUrl) {
+  const hops = [];
+  if (response) {
+    const chain = [];
+    for (let request = response.request().redirectedFrom(); request; request = request.redirectedFrom()) {
+      chain.unshift(request);
+    }
+    for (const request of chain) {
+      const hopResponse = await request.response().catch(() => null);
+      hops.push({ url: request.url(), status: hopResponse ? hopResponse.status() : 0 });
+    }
+  }
+  const responseUrl = response ? response.url() : requestedUrl;
+  const finalUrl = pageUrl || responseUrl;
+  return {
+    requestedUrl,
+    hops,
+    responseUrl,
+    finalUrl,
+    finalStatus: response ? response.status() : 0,
+    clientSide: withoutHash(finalUrl) !== withoutHash(responseUrl)
+  };
+}
+
+const LINK_RESOLVE_CONCURRENCY = 4;
+
+/**
+ * Live main-content links on the live host whose path has no stage link with the same path.
+ * Each is requested once per run on stage (GET, redirects followed) to learn its new path.
+ */
+async function resolveLinksOnStage({ live, stage, stageContext, stageUrl, cache, timeout }) {
+  let liveHost = "";
+  try {
+    liveHost = new URL(live.url).hostname.toLowerCase();
+  } catch {
+    return {};
+  }
+  const sameSite = (host) => !host || host === liveHost || host.replace(/^www\./, "") === liveHost.replace(/^www\./, "");
+  const stagePaths = new Set((stage.links || []).map((link) => link.pathname));
+  const candidates = [
+    ...new Set(
+      (live.links || [])
+        .filter((link) => sameSite(link.host) && String(link.pathname || "").startsWith("/") && !stagePaths.has(link.pathname))
+        .map((link) => link.pathname)
+    )
+  ];
+  const resolved = {};
+  await mapLimit(candidates, LINK_RESOLVE_CONCURRENCY, async (pathname) => {
+    if (!cache.has(pathname)) {
+      cache.set(
+        pathname,
+        stageContext.request
+          .get(joinOrigin(stageUrl, pathname), { timeout, maxRedirects: 10, failOnStatusCode: false })
+          .then(async (response) => {
+            const finalPath = response.ok() ? new URL(response.url()).pathname : null;
+            await response.dispose().catch(() => {});
+            return finalPath;
+          })
+          .catch(() => null)
+      );
+    }
+    const finalPath = await cache.get(pathname);
+    if (finalPath && finalPath !== pathname) resolved[pathname] = finalPath;
+  });
+  return resolved;
 }
 
 const MAX_HASH_IMAGES = 80;
@@ -803,6 +876,14 @@ async function main() {
   const pressReleasePattern = (process.env.PRESS_RELEASE_PATH_PATTERN || "press-releases").trim() || "press-releases";
   const pressReleaseDefaultImage =
     (process.env.PRESS_RELEASE_DEFAULT_IMAGE || "news-release-banner").trim() || "news-release-banner";
+  const rewordThreshold = Number(process.env.CONTENT_REWORD_THRESHOLD) || 0.8;
+  const redirectConfig = redirectConfigFromEnv(process.env, loginPath);
+  const chrome = chromeConfigFromEnv(process.env);
+  const failedChrome = {
+    headerMatch: chrome.header ? "No" : CHROME_NOT_CHECKED,
+    footerMatch: chrome.footer ? "No" : CHROME_NOT_CHECKED
+  };
+  const linkResolveCache = new Map();
 
   try {
     if (auth.drupalLogin) {
@@ -844,6 +925,8 @@ async function main() {
             page: pagePath,
             liveUrl: liveTarget,
             stageUrl: stageTarget,
+            stageFinalUrl: stage.redirect.finalUrl,
+            redirect: { live: live.redirect, stage: stage.redirect },
             live: live.fingerprint,
             stage: stage.fingerprint,
             diff: {
@@ -851,8 +934,8 @@ async function main() {
               imageMatch: "No",
               seoMatch: "No",
               urlMatch: "No",
-              headerMatch: "No",
-              footerMatch: "No",
+              redirectMatch: "No",
+              ...failedChrome,
               comment: stageOnLogin
                 ? "Stage returned the login page"
                 : `Stage returned HTTP ${stageStatus}`,
@@ -873,16 +956,33 @@ async function main() {
             timeout,
             threshold: hashThreshold
           });
+          const resolvedLinks = await resolveLinksOnStage({
+            live: live.fingerprint,
+            stage: stage.fingerprint,
+            stageContext,
+            stageUrl,
+            cache: linkResolveCache,
+            timeout
+          });
+          const redirect = { live: live.redirect, stage: stage.redirect };
           const diff = diffFingerprints(live.fingerprint, stage.fingerprint, {
             visual,
             pageType,
-            pressReleaseDefaultImage
+            pressReleaseDefaultImage,
+            rewordThreshold,
+            redirect,
+            redirectConfig,
+            resolvedLinks,
+            chrome
           });
           record = {
             page: pagePath,
             pageType,
             liveUrl: liveTarget,
             stageUrl: stageTarget,
+            stageFinalUrl: stage.redirect.finalUrl,
+            redirect,
+            resolvedLinks,
             live: live.fingerprint,
             stage: stage.fingerprint,
             visual,
@@ -900,8 +1000,8 @@ async function main() {
             imageMatch: "No",
             seoMatch: "No",
             urlMatch: "No",
-            headerMatch: "No",
-            footerMatch: "No",
+            redirectMatch: "No",
+            ...failedChrome,
             comment: message,
             verdict: "ERROR",
             reasons: [message]
@@ -956,13 +1056,14 @@ async function main() {
 
   const written = (await readdir(byPathDir).catch(() => [])).filter((name) => name.endsWith(".json"));
   if (written.length) {
-    const summary = await renderSummary(runDir);
-    await renderDashboard(runDir);
+    const { summary, issues } = await analyzeRun(runDir);
     console.log(
-      `[migralens] ${summary.counts.pass} pass, ${summary.counts.fail} fail, ${summary.counts.error} error`
+      `[migralens] ${summary.counts.pass} pass, ${summary.counts.aiVerified} AI-verified, ${summary.counts.fail} fail, ${summary.counts.error} error`
     );
-    console.log(`[migralens] ${path.join(runDir, "summary.html")}`);
-    console.log(`[migralens] ${path.join(runDir, "dashboard.html")}`);
+    console.log(
+      `[migralens] ${issues.counts.groups} issue groups (${issues.counts.global} global, ${issues.counts.repeated} repeated, ${issues.counts.page} page-specific)`
+    );
+    for (const name of ["summary.html", "issues.html", "dashboard.html"]) console.log(`[migralens] ${path.join(runDir, name)}`);
     if (summary.counts.fail || summary.counts.error) {
       process.exitCode = 1;
     }

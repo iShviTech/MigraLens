@@ -9,8 +9,16 @@
  * Content: main-content text blocks, case/whitespace/quote-insensitive, any order,
  * every live block must exist on stage and every stage block on live.
  * Images: visual match by perceptual hash (options.visual from run.js); falls back
- * to asset keys when no hashes are available. SEO and links stay strict.
+ * to asset keys when no hashes are available. Links stay strict.
+ * SEO: case-insensitive; a tag only on stage passes, a tag only on live fails. A stage
+ * canonical equal to the stage redirect target passes.
+ * Links: live paths that redirect on stage (options.resolvedLinks) match their target.
+ * Redirect: options.redirect from run.js; permanent hops to a 200 stage page (Yes),
+ * no redirect (N/A), anything else No.
  * Header / Footer: site header and footer text (any order) and links (unordered set).
+ * Each is compared only when options.chrome.header / options.chrome.footer is true
+ * (COMPARE_HEADER / COMPARE_FOOTER); compared sections count toward the verdict,
+ * skipped ones report "Not checked".
  * options.pageType "press-release" drops the default banner, read time, share widget,
  * and Media Contact / About boilerplate from main content, and compares date-only
  * blocks by calendar day.
@@ -58,6 +66,10 @@ function itemLines(items, singular, pluralNoun) {
   const more = items.length - PREVIEW_ITEMS;
   if (more > 0) lines.push(item(`${num(more)} more ${more === 1 ? singular : pluralNoun}`));
   return lines;
+}
+
+function seoKey(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function keywordList(raw) {
@@ -160,10 +172,11 @@ export function textKey(text) {
   return String(text || "")
     .normalize("NFKC")
     .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")
-    .replace(/[\u00A0\u2007\u202F]/g, " ")
+    .replace(/[\u00A0\u2007\u2009\u200A\u202F\u205F\u3000]/g, " ")
     .replace(/[\u2018\u2019\u201A\u201B\u2032\u00B4`]/g, "'")
     .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
     .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/-{2,}/g, "-")
     .replace(/\u2026/g, "...")
     .toLowerCase()
     .replace(/\s+/g, " ")
@@ -315,15 +328,108 @@ function blockLabel(block) {
   return `${String(block.tag || "").toUpperCase()}: ${clip(block.text, 120)}`;
 }
 
-function compareContent(live, stage) {
-  return compareBlocks(blocksOf(live), blocksOf(stage), "Content");
+const MARKUP = /<\/?[a-z][a-z0-9-]*(?:\s[^>]*)?>|\b(?:target|rel|href|class|style|src|alt)\s*=\s*["']|&(?:nbsp|amp|lt|gt|quot|#\d+);/i;
+
+/** True when visible text carries HTML tags, attributes, or entities (a migration bug, never tolerated). */
+export function hasMarkup(text) {
+  return MARKUP.test(String(text || ""));
 }
 
-function compareBlocks(liveBlocks, stageBlocks, section) {
+/** Letters and digits only: what a reader sees once punctuation, dashes, and spacing are ignored. */
+export function wordKey(text) {
+  return textKey(text)
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+const MAX_SIMILARITY_TOKENS = 400;
+
+/** Token-level Levenshtein ratio (1 = same words in the same order). */
+export function tokenSimilarity(a, b) {
+  const left = a.split(" ").filter(Boolean).slice(0, MAX_SIMILARITY_TOKENS);
+  const right = b.split(" ").filter(Boolean).slice(0, MAX_SIMILARITY_TOKENS);
+  const longest = Math.max(left.length, right.length);
+  if (!longest) return 1;
+  let previous = Array.from({ length: right.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= left.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j++) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost);
+    }
+    previous = current;
+  }
+  return 1 - previous[right.length] / longest;
+}
+
+function tokenChanges(liveWords, stageWords) {
+  const counts = new Map();
+  for (const word of stageWords.split(" ")) counts.set(word, (counts.get(word) || 0) + 1);
+  const removed = [];
+  for (const word of liveWords.split(" ")) {
+    const left = counts.get(word) || 0;
+    if (left > 0) counts.set(word, left - 1);
+    else removed.push(word);
+  }
+  const added = [...counts].flatMap(([word, left]) => Array(left).fill(word));
+  return { removed: removed.filter(Boolean), added: added.filter(Boolean) };
+}
+
+/**
+ * Blocks whose words (punctuation, dashes, and spacing ignored) appear in the other
+ * side's text are formatting-only: same content, or one block split / merged into
+ * neighbours. Blocks with visible markup are never tolerated.
+ */
+function splitFormattingOnly(blocks, otherWords, side, formatting) {
+  return blocks.filter((block) => {
+    const words = wordKey(block.key);
+    if (!words || hasMarkup(block.text) || !otherWords.includes(` ${words} `)) return true;
+    formatting.push({ side, text: block.text });
+    return false;
+  });
+}
+
+/** Pair each missing block with the closest stage-only block at or above `threshold`. */
+function pairReworded(missing, extra, threshold) {
+  const used = new Set();
+  const reworded = [];
+  const stillMissing = [];
+  for (const block of missing) {
+    const words = wordKey(block.key);
+    let best = null;
+    extra.forEach((candidate, index) => {
+      if (used.has(index)) return;
+      const other = wordKey(candidate.key);
+      const sizes = [words.split(" ").length, other.split(" ").length];
+      if (Math.min(...sizes) / Math.max(...sizes) < threshold) return;
+      const score = tokenSimilarity(words, other);
+      if (score >= threshold && (!best || score > best.score)) best = { index, score, other };
+    });
+    if (!best) {
+      stillMissing.push(block);
+      continue;
+    }
+    used.add(best.index);
+    reworded.push({ live: block, stage: extra[best.index], similarity: Number(best.score.toFixed(3)), ...tokenChanges(words, best.other) });
+  }
+  return { reworded, stillMissing, stillExtra: extra.filter((_, index) => !used.has(index)) };
+}
+
+function compareContent(live, stage, options) {
+  return compareBlocks(blocksOf(live), blocksOf(stage), "Content", options);
+}
+
+function compareBlocks(liveBlocks, stageBlocks, section, options = {}) {
+  const threshold = Number(options.rewordThreshold) || 0.8;
   const liveText = textKey(liveBlocks.map((block) => block.key).join(" "));
   const stageText = textKey(stageBlocks.map((block) => block.key).join(" "));
-  const missing = blocksMissingFrom(liveBlocks, stageText);
-  const extra = blocksMissingFrom(stageBlocks, liveText);
+  const formatting = [];
+  const strictMissing = blocksMissingFrom(liveBlocks, stageText);
+  const strictExtra = blocksMissingFrom(stageBlocks, liveText);
+  const tolerantMissing = splitFormattingOnly(strictMissing, ` ${wordKey(stageText)} `, "Live", formatting);
+  const tolerantExtra = splitFormattingOnly(strictExtra, ` ${wordKey(liveText)} `, "Stage", formatting);
+  const { reworded, stillMissing: missing, stillExtra: extra } = pairReworded(tolerantMissing, tolerantExtra, threshold);
+
   const lines = [];
   if (missing.length) {
     lines.push(`- Missing on Stage (${num(missing.length)}): Text on Live not found on Stage.`);
@@ -333,25 +439,56 @@ function compareBlocks(liveBlocks, stageBlocks, section) {
     lines.push(`- Only on Stage (${num(extra.length)}): Text on Stage not found on Live.`);
     lines.push(...itemLines(extra.map(blockLabel), "text block", "text blocks"));
   }
+  if (reworded.length) {
+    lines.push(`- Reworded (${num(reworded.length)}): Same block on both sides, but words differ.`);
+    const labels = reworded.map(
+      (pair) =>
+        `${blockLabel(pair.live)} → removed: ${clip(pair.removed.join(" ") || "none", 60)} | added: ${clip(pair.added.join(" ") || "none", 60)}`
+    );
+    lines.push(...itemLines(labels, "text block", "text blocks"));
+  }
   const list = {
     liveItems: missing.map(blockLabel),
     stageItems: extra.map(blockLabel),
     liveRefs: missing.map((block) => block.ref || ""),
     stageRefs: extra.map((block) => block.ref || "")
   };
-  const elements = pairElements(
-    section,
-    list,
-    missing.map((_, i) => i),
-    extra.map((_, i) => i)
-  );
+  const elements = [
+    ...pairElements(
+      section,
+      list,
+      missing.map((_, i) => i),
+      extra.map((_, i) => i)
+    ),
+    ...reworded.slice(0, MAX_ELEMENTS).map((pair) => ({
+      section,
+      label: `Reworded: ${blockLabel(pair.live)}`,
+      live: pair.live.ref || null,
+      stage: pair.stage.ref || null
+    }))
+  ];
+  const notes = [];
+  if (formatting.length) {
+    notes.push(`- ${section}: punctuation, spacing, or block split only (${num(formatting.length)}), counted as a match`);
+    notes.push(...itemLines(formatting.map((entry) => `${entry.side}: ${clip(entry.text, 120)}`), "text block", "text blocks"));
+  }
   return {
-    ok: !missing.length && !extra.length,
+    ok: !missing.length && !extra.length && !reworded.length,
     lines,
     elements,
+    notes,
     details: {
       textMissingOnStage: missing.map((block) => block.text),
-      textOnlyOnStage: extra.map((block) => block.text)
+      textOnlyOnStage: extra.map((block) => block.text),
+      textReworded: reworded.map((pair) => ({
+        live: pair.live.text,
+        stage: pair.stage.text,
+        underHeading: pair.live.underHeading || "",
+        similarity: pair.similarity,
+        removed: pair.removed,
+        added: pair.added
+      })),
+      textFormattingOnly: formatting
     }
   };
 }
@@ -543,24 +680,47 @@ function compareImagesByAsset(live, stage) {
   return { ok, lines, elements };
 }
 
-function compareSeo(live, stage) {
+/** stageFinalPath: set when stage redirected, so the canonical may follow the new path. */
+function compareSeo(live, stage, stageFinalPath = "") {
   const liveSeo = live.seo || {};
   const stageSeo = stage.seo || {};
   const lines = [];
+  const notes = [];
+  const seoDiffs = [];
+  let failed = false;
 
   for (const [key, label] of SEO_FIELDS) {
     const liveValue = liveSeo[key] || "";
     const stageValue = stageSeo[key] || "";
-    if (liveValue !== stageValue) {
+    if (
+      key === "canonicalPath" &&
+      stageFinalPath &&
+      seoKey(liveValue) &&
+      seoKey(liveValue) !== seoKey(stageValue) &&
+      samePath(seoKey(stageValue), seoKey(stageFinalPath))
+    ) {
+      notes.push(`- SEO: Canonical follows the Stage redirect (Live ${liveValue} -> Stage ${stageValue}), counted as a match`);
+      seoDiffs.push({ field: key, label, live: liveValue, stage: stageValue, ignored: true, viaRedirect: true });
+      continue;
+    }
+    if (!seoKey(liveValue) && seoKey(stageValue)) {
+      lines.push(`- ${label} (only on Stage, ignored)`, item(`Stage: ${valueOrEmpty(stageValue)}`));
+      notes.push(`- SEO: ${label} only on Stage, counted as a match`);
+      seoDiffs.push({ field: key, label, live: liveValue, stage: stageValue, ignored: true });
+    } else if (seoKey(liveValue) !== seoKey(stageValue)) {
+      failed = true;
       lines.push(`- ${label}`, item(`Live: ${valueOrEmpty(liveValue)}`), item(`Stage: ${valueOrEmpty(stageValue)}`));
+      seoDiffs.push({ field: key, label, live: liveValue, stage: stageValue });
     }
   }
 
-  const liveKeywords = keywordList(liveSeo.keywords);
-  const stageKeywords = keywordList(stageSeo.keywords);
+  const liveKeywords = keywordList(liveSeo.keywords).map((keyword) => keyword.toLowerCase()).sort();
+  const stageKeywords = keywordList(stageSeo.keywords).map((keyword) => keyword.toLowerCase()).sort();
+  const missing = liveKeywords.filter((keyword) => !stageKeywords.includes(keyword));
+  const extra = stageKeywords.filter((keyword) => !liveKeywords.includes(keyword));
   if (liveKeywords.join("\0") !== stageKeywords.join("\0")) {
-    const missing = liveKeywords.filter((keyword) => !stageKeywords.includes(keyword));
-    const extra = stageKeywords.filter((keyword) => !liveKeywords.includes(keyword));
+    if (liveKeywords.length) failed = true;
+    else notes.push("- SEO: Meta Keywords only on Stage, counted as a match");
     const liveLine = liveKeywords.length
       ? `${liveKeywords.join(", ")}${!stageKeywords.length ? " (missing on Stage)" : ""}`
       : "Not available";
@@ -575,15 +735,208 @@ function compareSeo(live, stage) {
     }
   }
 
-  return { ok: lines.length === 0, lines, elements: [] };
+  return {
+    ok: !failed,
+    lines,
+    notes,
+    elements: [],
+    details: { seoDiffs, keywordsMissingOnStage: missing, keywordsOnlyOnStage: extra }
+  };
 }
 
-function compareLinks(live, stage) {
-  const list = listOf(live.links || [], stage.links || [], linkLabel);
+/** Live links whose old path redirects on stage take the redirect target before matching. */
+function compareLinks(live, stage, resolvedLinks = {}) {
+  const stageLabels = new Set((stage.links || []).map(linkLabel));
+  const viaRedirect = [];
+  const liveLinks = (live.links || []).map((link) => {
+    const target = resolvedLinks[link.pathname];
+    if (!target) return link;
+    const mapped = { ...link, pathname: target };
+    if (stageLabels.has(linkLabel(mapped))) viaRedirect.push(`${linkLabel(link)} (Stage: ${target})`);
+    return mapped;
+  });
+  const notes = viaRedirect.length
+    ? [`- Links matched via Stage redirect (${num(viaRedirect.length)})`, ...itemLines(viaRedirect, "link", "links")]
+    : [];
+  const list = listOf(liveLinks, stage.links || [], linkLabel);
   const ok = sameOrdered(list.liveItems, list.stageItems);
-  if (ok) return { ok, lines: [], elements: [] };
+  if (ok) return { ok, lines: [], elements: [], notes, details: { linksViaRedirect: viaRedirect } };
   const described = describeLists("Links", list, { one: "link", many: "links" });
-  return { ok, lines: described.lines, elements: described.elements };
+  const missing = missingFrom(list.liveItems, list.stageItems);
+  const extra = missingFrom(list.stageItems, list.liveItems);
+  return {
+    ok,
+    lines: described.lines,
+    elements: described.elements,
+    notes,
+    details: {
+      linksMissingOnStage: missing.map((i) => ({ text: liveLinks[i].text || "", pathname: liveLinks[i].pathname || "" })),
+      linksOnlyOnStage: extra.map((i) => ({ text: stage.links[i].text || "", pathname: stage.links[i].pathname || "" })),
+      linksOrderOnly: !missing.length && !extra.length,
+      linksViaRedirect: viaRedirect
+    }
+  };
+}
+
+const DEFAULT_REDIRECT_STATUS = [301, 308];
+
+export function redirectConfigFromEnv(env = process.env, loginPath = "") {
+  const allowedStatus = String(env.REDIRECT_ALLOWED_STATUS || "")
+    .split(",")
+    .map((part) => Number(part.trim()))
+    .filter((code) => code >= 300 && code < 400);
+  let requiredPattern = null;
+  const rawPattern = String(env.REDIRECT_REQUIRED_PATTERN || "").trim();
+  if (rawPattern) {
+    try {
+      requiredPattern = new RegExp(rawPattern, "i");
+    } catch {
+      requiredPattern = null;
+    }
+  }
+  return {
+    allowedStatus: allowedStatus.length ? allowedStatus : DEFAULT_REDIRECT_STATUS,
+    maxHops: Math.max(1, Math.floor(Number(env.REDIRECT_MAX_HOPS) || 3)),
+    requiredPattern: rawPattern || null,
+    requiredRegex: requiredPattern,
+    loginPath: (loginPath || env.STAGE_LOGIN_PATH || "/member/login").trim()
+  };
+}
+
+function envFlag(env, name, fallback) {
+  const raw = String(env[name] || "").trim().toLowerCase();
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
+export function chromeConfigFromEnv(env = process.env) {
+  return {
+    header: envFlag(env, "COMPARE_HEADER", true),
+    footer: envFlag(env, "COMPARE_FOOTER", true)
+  };
+}
+
+export const CHROME_NOT_CHECKED = "Not checked";
+
+function urlParts(value) {
+  try {
+    const url = new URL(value);
+    return { host: url.hostname.toLowerCase(), path: url.pathname || "/" };
+  } catch {
+    return { host: "", path: String(value || "") };
+  }
+}
+
+function samePath(a, b) {
+  const trim = (value) => String(value || "").replace(/\/+$/, "") || "/";
+  return trim(a) === trim(b);
+}
+
+/** Readable chain: "/old -> 301 -> /new (200)"; other hosts keep the full URL. */
+function redirectChainText(chain) {
+  const origin = urlParts(chain.requestedUrl).host;
+  const show = (value) => {
+    const parts = urlParts(value);
+    return parts.host && parts.host !== origin ? value : parts.path;
+  };
+  const steps = [show(chain.requestedUrl)];
+  const hops = chain.hops || [];
+  hops.forEach((hop, index) => {
+    steps.push(String(hop.status || "?"), show(index + 1 < hops.length ? hops[index + 1].url : chain.responseUrl));
+  });
+  let text = steps.join(" -> ");
+  text += ` (${chain.finalStatus || "?"})`;
+  if (chain.clientSide) text += ` -> client-side -> ${show(chain.finalUrl)}`;
+  return text;
+}
+
+/**
+ * Stage must answer the old live path with permanent redirects to a 200 page on the
+ * stage host (not home or login). No redirect with a 2xx is N/A unless the path
+ * matches REDIRECT_REQUIRED_PATTERN.
+ */
+function compareRedirect(redirect, config = {}) {
+  const stage = redirect?.stage;
+  if (!stage) return { ok: true, value: "Not checked", lines: [], notes: [], details: {} };
+  const allowed = config.allowedStatus || DEFAULT_REDIRECT_STATUS;
+  const maxHops = config.maxHops || 3;
+  const requested = urlParts(stage.requestedUrl);
+  const final = urlParts(stage.finalUrl);
+  const hops = stage.hops || [];
+  const chain = redirectChainText(stage);
+  const redirected = hops.length > 0 || stage.clientSide || requested.host !== final.host || requested.path !== final.path;
+  const statusOk = stage.finalStatus >= 200 && stage.finalStatus < 300;
+  const problems = [];
+
+  if (!redirected) {
+    if (!statusOk) {
+      problems.push({ kind: "missing", status: stage.finalStatus, text: `Old path returns HTTP ${stage.finalStatus || "?"} on Stage and does not redirect.` });
+    } else if (config.requiredRegex?.test(requested.path)) {
+      problems.push({ kind: "missing", status: stage.finalStatus, text: `Expected a redirect (REDIRECT_REQUIRED_PATTERN ${config.requiredPattern}), but Stage served the old path directly.` });
+    }
+  } else {
+    const temporary = hops.filter((hop) => !allowed.includes(hop.status));
+    if (temporary.length) {
+      problems.push({
+        kind: "temporary",
+        status: temporary[0].status,
+        text: `Non-permanent redirect ${[...new Set(temporary.map((hop) => hop.status))].join(", ")} (allowed: ${allowed.join(", ")}).`
+      });
+    }
+    if (hops.length > maxHops) {
+      problems.push({ kind: "chain", hops: hops.length, text: `${hops.length} hops (max ${maxHops}).` });
+    }
+    if (new Set(hops.map((hop) => withoutHash(hop.url))).size !== hops.length) {
+      problems.push({ kind: "loop", text: "Redirect loop: the same URL appears twice in the chain." });
+    }
+    if (stage.clientSide) {
+      problems.push({ kind: "clientSide", text: "Client-side (JavaScript or meta refresh) redirect instead of a server redirect." });
+    }
+    if (!statusOk) {
+      problems.push({ kind: "broken", status: stage.finalStatus, text: `Redirect target returns HTTP ${stage.finalStatus || "?"}.` });
+    }
+    if (final.host && requested.host && final.host !== requested.host) {
+      problems.push({ kind: "offHost", host: final.host, text: `Redirect leaves the Stage host (${final.host}).` });
+    }
+    if (samePath(final.path, "/") && !samePath(requested.path, "/")) {
+      problems.push({ kind: "toHome", text: "Redirects to the home page instead of the matching page." });
+    } else if (config.loginPath && samePath(final.path, config.loginPath) && !samePath(requested.path, config.loginPath)) {
+      problems.push({ kind: "toLogin", text: "Redirects to the login page." });
+    }
+  }
+
+  const notes = [];
+  if (redirected) notes.push(`- Redirect: Stage ${chain}`);
+  if (hops.length > 1 && !problems.some((problem) => problem.kind === "chain")) {
+    notes.push(`- Redirect: ${hops.length} hops (a single hop is preferred)`);
+  }
+  const liveChain = redirect.live;
+  if (liveChain && (liveChain.hops || []).length) notes.push(`- Redirect: Live ${redirectChainText(liveChain)} (informational)`);
+
+  const ok = !problems.length;
+  const lines = ok ? [] : [`- Chain`, item(`Stage: ${chain}`), ...problems.map((problem) => `- ${problem.text}`)];
+  return {
+    ok,
+    value: ok ? (redirected ? "Yes" : "N/A") : "No",
+    lines,
+    notes,
+    elements: [],
+    details: {
+      redirect: {
+        redirected,
+        requestedPath: requested.path,
+        finalPath: final.path,
+        finalStatus: stage.finalStatus,
+        hops,
+        chain,
+        problems
+      }
+    }
+  };
+}
+
+function withoutHash(value) {
+  return String(value || "").split("#")[0];
 }
 
 /** Unique labels in `a` not present in `b`, as indices into `a` (first occurrence). */
@@ -600,7 +953,7 @@ function uniqueMissingFrom(a, b) {
 }
 
 /** Site header or footer: text any order both ways, links as an unordered set of text and path. */
-function compareChrome(liveChrome, stageChrome, section) {
+function compareChrome(liveChrome, stageChrome, section, options = {}) {
   const key = section.toLowerCase();
   const missingSides = [["Live", liveChrome], ["Stage", stageChrome]]
     .filter(([, chrome]) => !chrome || !chrome.selectorUsed)
@@ -610,11 +963,11 @@ function compareChrome(liveChrome, stageChrome, section) {
       ok: false,
       lines: [`- ${section} not found on ${missingSides.join(" and ")}. Set ${missingSides.map((side) => `${side.toUpperCase()}_${section.toUpperCase()}_SELECTOR`).join(" / ")}.`],
       elements: [],
-      details: {}
+      details: { [`${key}NotFound`]: missingSides }
     };
   }
 
-  const text = compareBlocks(blocksOf(liveChrome), blocksOf(stageChrome), section);
+  const text = compareBlocks(blocksOf(liveChrome), blocksOf(stageChrome), section, options);
   const linkList = listOf(liveChrome.links || [], stageChrome.links || [], (link) => linkLabel(link).toLowerCase());
   const missing = uniqueMissingFrom(linkList.liveItems, linkList.stageItems);
   const extra = uniqueMissingFrom(linkList.stageItems, linkList.liveItems);
@@ -631,9 +984,11 @@ function compareChrome(liveChrome, stageChrome, section) {
     ok: text.ok && !missing.length && !extra.length,
     lines,
     elements: [...text.elements, ...pairElements(section, linkList, missing, extra)],
+    notes: text.notes,
     details: {
       [`${key}TextMissingOnStage`]: text.details.textMissingOnStage,
       [`${key}TextOnlyOnStage`]: text.details.textOnlyOnStage,
+      [`${key}TextReworded`]: text.details.textReworded,
       [`${key}LinksMissingOnStage`]: missing.map((i) => linkLabel(liveChrome.links[i])),
       [`${key}LinksOnlyOnStage`]: extra.map((i) => linkLabel(stageChrome.links[i]))
     }
@@ -642,18 +997,15 @@ function compareChrome(liveChrome, stageChrome, section) {
 
 const MIN_MAIN_TEXT = 50;
 
-function notesLines(live, stage, extraLines = []) {
+function notesLines(live, stage, extraLines = [], chrome = { header: true, footer: true }) {
   const scope = (fingerprint) =>
     `${fingerprint.mainSelectorUsed || "body"}${fingerprint.mainSelectorMissing ? " (configured selector not found)" : ""}`;
-  const chromeScope = (chrome) =>
-    chrome?.selectorUsed ? `${chrome.selectorUsed}${chrome.selectorMissing ? " (configured selector not found)" : ""}` : "not found";
-  const lines = [
-    "Notes",
-    `- Scope: Live – ${scope(live)} | Stage – ${scope(stage)}`,
-    `- Header: Live – ${chromeScope(live.header)} | Stage – ${chromeScope(stage.header)}`,
-    `- Footer: Live – ${chromeScope(live.footer)} | Stage – ${chromeScope(stage.footer)}`,
-    ...extraLines
-  ];
+  const chromeScope = (part) =>
+    part?.selectorUsed ? `${part.selectorUsed}${part.selectorMissing ? " (configured selector not found)" : ""}` : "not found";
+  const lines = ["Notes", `- Scope: Live – ${scope(live)} | Stage – ${scope(stage)}`];
+  if (chrome.header) lines.push(`- Header: Live – ${chromeScope(live.header)} | Stage – ${chromeScope(stage.header)}`);
+  if (chrome.footer) lines.push(`- Footer: Live – ${chromeScope(live.footer)} | Stage – ${chromeScope(stage.footer)}`);
+  lines.push(...extraLines);
   for (const [side, fingerprint] of [["Live", live], ["Stage", stage]]) {
     if (fingerprint.popupsClosed?.length) {
       lines.push(`- Popups closed on ${side} (${num(fingerprint.popupsClosed.length)})`);
@@ -668,6 +1020,7 @@ function notesLines(live, stage, extraLines = []) {
 }
 
 export function diffFingerprints(live, stage, options = {}) {
+  const chrome = { header: true, footer: true, ...(options.chrome || {}) };
   if (!live || !stage) {
     const comment = "Missing live or stage fingerprint";
     return {
@@ -675,14 +1028,15 @@ export function diffFingerprints(live, stage, options = {}) {
       imagesOk: false,
       seoOk: false,
       urlsOk: false,
-      headerOk: false,
-      footerOk: false,
+      headerOk: chrome.header ? false : null,
+      footerOk: chrome.footer ? false : null,
       contentMatch: "No",
       imageMatch: "No",
       seoMatch: "No",
       urlMatch: "No",
-      headerMatch: "No",
-      footerMatch: "No",
+      redirectMatch: "No",
+      headerMatch: chrome.header ? "No" : CHROME_NOT_CHECKED,
+      footerMatch: chrome.footer ? "No" : CHROME_NOT_CHECKED,
       comment,
       verdict: "ERROR",
       reasons: [comment]
@@ -705,14 +1059,20 @@ export function diffFingerprints(live, stage, options = {}) {
     );
   }
 
+  const redirect = compareRedirect(options.redirect, options.redirectConfig);
+  const movedPath = !options.redirect && stage.pathname && live.pathname && !samePath(stage.pathname, live.pathname) ? stage.pathname : "";
+  const stageFinalPath = redirect.details.redirect?.redirected ? redirect.details.redirect.finalPath : movedPath;
   const sections = [
-    ["Content", compareContent(liveMain, stageMain)],
+    ["Content", compareContent(liveMain, stageMain, options)],
     ["Images", compareImages(liveMain, stageMain, options.visual)],
-    ["SEO", compareSeo(live, stage)],
-    ["Links", compareLinks(liveMain, stageMain)],
-    ["Header", compareChrome(live.header, stage.header, "Header")],
-    ["Footer", compareChrome(live.footer, stage.footer, "Footer")]
+    ["SEO", compareSeo(live, stage, stageFinalPath)],
+    ["Links", compareLinks(liveMain, stageMain, options.resolvedLinks || {})],
+    ["Redirect", redirect]
   ];
+  if (chrome.header) sections.push(["Header", compareChrome(live.header, stage.header, "Header", options)]);
+  if (chrome.footer) sections.push(["Footer", compareChrome(live.footer, stage.footer, "Footer", options)]);
+  const okOf = (label) => sections.find(([name]) => name === label)?.[1].ok ?? null;
+  for (const [, result] of sections) extraNotes.push(...(result.notes || []));
 
   const tooShort = [["live", live], ["stage", stage]]
     .filter(([, fingerprint]) => pageTextOf(fingerprint).length < MIN_MAIN_TEXT)
@@ -729,8 +1089,10 @@ export function diffFingerprints(live, stage, options = {}) {
     elements.push(...result.elements.filter((element) => element.live || element.stage));
   }
 
-  const [content, images, seo, links, header, footer] = sections.map(([, result]) => result.ok);
-  let verdict = content && images && seo && links && header && footer ? "PASS" : "FAIL";
+  const [content, images, seo, links, redirectOk] = ["Content", "Images", "SEO", "Links", "Redirect"].map(okOf);
+  const header = okOf("Header");
+  const footer = okOf("Footer");
+  let verdict = sections.every(([, result]) => result.ok) ? "PASS" : "FAIL";
   if (tooShort.length) {
     verdict = "ERROR";
     const message = `Main content not found or nearly empty on ${tooShort.join(" and ")} (under ${MIN_MAIN_TEXT} characters). Set LIVE_MAIN_SELECTOR / STAGE_MAIN_SELECTOR.`;
@@ -738,7 +1100,7 @@ export function diffFingerprints(live, stage, options = {}) {
     blocks.unshift(message);
   }
   if (verdict === "PASS") blocks.unshift("All checks match.");
-  blocks.push(notesLines(live, stage, extraNotes).join("\n"));
+  blocks.push(notesLines(live, stage, extraNotes, chrome).join("\n"));
 
   return {
     pageType,
@@ -746,14 +1108,16 @@ export function diffFingerprints(live, stage, options = {}) {
     imagesOk: images,
     seoOk: seo,
     urlsOk: links,
+    redirectOk,
     headerOk: header,
     footerOk: footer,
     contentMatch: yesNo(content),
     imageMatch: yesNo(images),
     seoMatch: yesNo(seo),
     urlMatch: yesNo(links),
-    headerMatch: yesNo(header),
-    footerMatch: yesNo(footer),
+    redirectMatch: redirect.value,
+    headerMatch: header === null ? CHROME_NOT_CHECKED : yesNo(header),
+    footerMatch: footer === null ? CHROME_NOT_CHECKED : yesNo(footer),
     comment: blocks.join("\n\n"),
     verdict,
     reasons,

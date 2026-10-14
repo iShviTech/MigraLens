@@ -21,7 +21,7 @@ Do **not** edit any content. Use read-only access only.
 
 ## Preconditions
 
-1. Read `.env` for `LIVE_URL`, `STAGE_URL`, `STAGE_BASIC_AUTH`, `STAGE_BASIC_USER`, `STAGE_BASIC_PASS`, `STAGE_DRUPAL_LOGIN`, `STAGE_LOGIN_PATH` (default `/member/login`), `STAGE_DRUPAL_USER`, `STAGE_DRUPAL_PASS`, `COMPARE_PATHS`, and optional `LIVE_MAIN_SELECTOR`, `STAGE_MAIN_SELECTOR`, `LIVE_HEADER_SELECTOR`, `STAGE_HEADER_SELECTOR`, `LIVE_FOOTER_SELECTOR`, `STAGE_FOOTER_SELECTOR`, `LIVE_POPUP_CLOSE_SELECTORS`, `STAGE_POPUP_CLOSE_SELECTORS`, `IMAGE_HASH_THRESHOLD`, `PRESS_RELEASE_PATH_PATTERN` (default `press-releases`), `PRESS_RELEASE_DEFAULT_IMAGE` (default `news-release-banner`).
+1. Read `.env` for `LIVE_URL`, `STAGE_URL`, `STAGE_BASIC_AUTH`, `STAGE_BASIC_USER`, `STAGE_BASIC_PASS`, `STAGE_DRUPAL_LOGIN`, `STAGE_LOGIN_PATH` (default `/member/login`), `STAGE_DRUPAL_USER`, `STAGE_DRUPAL_PASS`, `COMPARE_PATHS`, and optional `LIVE_MAIN_SELECTOR`, `STAGE_MAIN_SELECTOR`, `COMPARE_HEADER` (default `true`), `COMPARE_FOOTER` (default `true`), `LIVE_HEADER_SELECTOR`, `STAGE_HEADER_SELECTOR`, `LIVE_FOOTER_SELECTOR`, `STAGE_FOOTER_SELECTOR`, `LIVE_POPUP_CLOSE_SELECTORS`, `STAGE_POPUP_CLOSE_SELECTORS`, `IMAGE_HASH_THRESHOLD`, `PRESS_RELEASE_PATH_PATTERN` (default `press-releases`), `PRESS_RELEASE_DEFAULT_IMAGE` (default `news-release-banner`), `REDIRECT_ALLOWED_STATUS` (default `301,308`), `REDIRECT_MAX_HOPS` (default 3), `REDIRECT_REQUIRED_PATTERN` (default empty).
 2. Never echo passwords or basic-auth credentials in chat, reports, or screenshots of filled forms.
 3. `LIVE_URL` and `STAGE_URL` are required. Live never needs credentials. Require `STAGE_BASIC_USER` / `STAGE_BASIC_PASS` only when `STAGE_BASIC_AUTH=true`. Require `STAGE_DRUPAL_USER` / `STAGE_DRUPAL_PASS` only when `STAGE_DRUPAL_LOGIN=true`. If a required value is missing, stop and ask the user to fill `.env`. Do not invent hosts or passwords.
 4. Use the project Playwright MCP (`project-0-MigraLens-playwright` / `playwright`). Prefer two tabs: one live, one stage.
@@ -98,7 +98,10 @@ Text, headings, images, and links come from the main-content root. That root is 
 - Text is split into blocks at block-element boundaries (p, h1–h6, li, td, div, and so on). Hidden accordion and tab text is included. Screen-reader-only text and slider clones are excluded.
 - Normalize both sides: NFKC, **lowercase** ("About Us" = "ABOUT US"), curly quotes become straight quotes, dashes become `-`, NBSP and zero-width characters are removed, and whitespace is collapsed. Punctuation and wording are kept.
 - Every live block must appear in the stage main text, and every stage block must appear in the live main text. **Order and layout do not matter.** Heading level (H1 vs H2) does not matter. Heading text does.
-- Any missing, extra, or reworded text → content No. The full lists are in `diff.details.textMissingOnStage` / `textOnlyOnStage`.
+- Normalization also treats `--` as `-` and thin / narrow spaces as spaces.
+- **Formatting-only tolerance:** a block whose letters and digits (`wordKey`: punctuation, dashes, and spacing removed) appear in the other side's text counts as a match. This covers punctuation-only changes and a block split or merged into neighbours (compound components restructured). It is listed under Notes and in `details.textFormattingOnly`. A block with visible markup (`hasMarkup`: tags, `target="…"`-style attributes, entities) is never tolerated.
+- **Reworded:** a remaining missing/extra pair with token similarity ≥ `CONTENT_REWORD_THRESHOLD` (default 0.8) is reported once as "Reworded" with removed/added words (`details.textReworded`). It still fails.
+- Any missing, extra, or reworded text → content No. The full lists are in `diff.details.textMissingOnStage` / `textOnlyOnStage` / `textReworded`.
 
 ### Image pass rules (strict, visual)
 
@@ -108,21 +111,40 @@ Text, headings, images, and links come from the main-content root. That root is 
 - A stage image that fails to load or decode → image No. A live image that cannot be loaded, or is still a lazy placeholder, also fails (it cannot be verified).
 - Full lists are in `diff.details.imagesMissingOnStage` / `imagesOnlyOnStage` / `imagesFailedOnLive` / `imagesFailedOnStage`. Hashes and the distance matrix are in the record's `visual`.
 
-### SEO pass rules (strict)
+### SEO pass rules
 
-Compare `seo` after whitespace normalize. Canonical path and `og:image` asset key ignore host.
+Fields: `title`, `description`, `robots`, `canonicalPath`, `ogTitle`, `ogDescription`, `ogImage`, `twitterTitle`, `twitterDescription`, and `keywords`. Canonical path and `og:image` asset key ignore host.
 
-- `title`, `description`, `robots`
-- `keywords` as a trimmed, sorted set (order alone does not fail; comment lists missing and extra keywords)
-- `canonicalPath`
-- `ogTitle`, `ogDescription`, `ogImage`
-- `twitterTitle`, `twitterDescription`
+- Empty on both sides → match.
+- Empty on live, present on stage → match (listed in the comment Notes as "only on Stage").
+- Present on live, empty on stage → No (missing on Stage).
+- Present on both → must be equal after whitespace normalize, ignoring case.
+- Extra tags on stage never fail; only live values are required on stage.
+- Canonical after a redirect: when stage redirected the old path, a stage canonical equal to the stage final path is a match (Notes: "Canonical follows the Stage redirect").
+- `keywords`: if live has none, match. Otherwise compare as a trimmed, lowercased, sorted set (order alone does not fail; comment lists missing and extra keywords).
 
 ### URL pass rules (strict)
 
 Compare ordered in-page links (`pathname` + link text) from the main-content root. `http(s)` and relative links use pathname only, so hosts are ignored. `mailto:` and `tel:` keep the raw href.
 
-### Header and footer pass rules (strict)
+- A live same-site link whose path has no stage link with that path is requested once per run on stage (read-only GET, redirects followed). When it lands on a new path, the live link takes that path before matching (Notes: "Links matched via Stage redirect"). Resolutions are stored in `record.resolvedLinks`.
+
+### Redirect pass rules (separate Redirect column)
+
+Follow the skill [`.cursor/skills/verify-redirects/SKILL.md`](.cursor/skills/verify-redirects/SKILL.md) when checking or reporting redirects.
+
+Stage is always opened at the live path, so renamed pages (for example `/article/350000-babies-...` → `/about-us/media-and-news/2016-press-releases/350000-babies-...`) are verified by following the stage redirect. `run.js` stores the chain in `record.redirect.stage` (`requestedUrl`, `hops` with status per hop, `responseUrl`, `finalUrl`, `finalStatus`, `clientSide`) and the stage final URL in `record.stageFinalUrl`. The live chain is stored too, informational only.
+
+- `N/A`: stage served the path directly with 2xx. Counts as a pass, unless the path matches `REDIRECT_REQUIRED_PATTERN` (then No, "expected a redirect").
+- `Yes`: every hop status is in `REDIRECT_ALLOWED_STATUS` (default `301,308`), at most `REDIRECT_MAX_HOPS` hops (default 3), final response 2xx on the stage host, and the target is not `/` or the login page.
+- `No`: temporary redirect (302/307), broken target, loop, client-side (JS or meta refresh) redirect, redirect to home or login, leaves the stage host, or the old path returns 4xx/5xx without redirecting.
+- The chain (`/old -> 301 -> /new (200)`) is always in the comment Notes; on No it is in the Redirect section with the reasons.
+- Content, image, SEO, and link checks run against the redirect target, so a valid redirect to the wrong page still fails on content.
+- Older runs without redirect data show `Not checked`, which does not fail.
+
+### Header and footer pass rules (strict, optional)
+
+`COMPARE_HEADER` / `COMPARE_FOOTER` (default `true`) turn each check on or off. When on, a mismatch fails the verdict like any other column. When off, the column is `Not checked`, no header/footer issues or Notes lines are produced, and the verdict ignores it.
 
 - Header root: `LIVE_HEADER_SELECTOR` / `STAGE_HEADER_SELECTOR`, else the first outermost `header` / `[role=banner]` outside main, plus following siblings whose class contains `header`. Footer root: `LIVE_FOOTER_SELECTOR` / `STAGE_FOOTER_SELECTOR`, else the last outermost `footer` / `[role=contentinfo]`, plus preceding siblings whose class contains `footer` (the Drupal theme splits the footer into `.footer__main--wrapper` and `footer.footer`). A configured selector may match several elements; all are used.
 - Text uses the content rules (normalized, any order, both directions). Links are an unordered set of link text + pathname (duplicates such as desktop and mobile menus count once). Images are not compared.
@@ -139,9 +161,31 @@ A page is a press release when the stage final URL matches `PRESS_RELEASE_PATH_P
 
 Date-only blocks are compared by calendar day (`03/22/2016` = `22 Mar 2016`). Every ignored item is listed in the comment Notes. SEO and header/footer rules do not change.
 
+Stage header note (savethechildren.ca): the stage `header.header` holds only the logo and DONATE; the live main menu has no stage equivalent yet. The default header root is correct, so do not set `STAGE_HEADER_SELECTOR` to hide this. It is reported once as a global issue.
+
+## Analyze: issue grouping and AI review
+
+`npm run content-compare:analyze -- <run-dir>` (no argument = `COMPARE_RESUME`, else the newest run) re-diffs the stored fingerprints and `visual` with the current rules, runs the optional AI review, applies verdicts, groups issues, and re-renders every report. `run.js` calls it at the end of each run. Auth-failed `ERROR` records keep their original diff.
+
+### Issue grouping (`classify-issues.js`)
+
+- Every diff item becomes an issue with a templated `signature`, `section`, `category`, and `severity`. Categories: `data-loss` (critical for main text/images, high for links/header/footer), `markup-leak` (high), `image-failed`, `extra-content`, `reworded`, `seo-pattern` (separator change, suffix removed/added, field missing on stage, canonical moved), `link-changed` (same link text, new path), `redirect` (`redirect.missing`, `redirect.temporary:302`, `redirect.broken:404`, `redirect.toHome`, `redirect.toLogin`, `redirect.clientSide`, `redirect.loop`, `redirect.offHost`: high; `redirect.chain:N`: info), `chrome-not-found`, `formatting-only` (info; includes SEO fields only on stage, canonical following the redirect, and links matched via redirect, which count as a match), `error`.
+- Signatures exclude page-specific text unless the text is the issue, so one template problem is one group. Header/footer items collapse into one issue per kind with the items listed.
+- Groups on at least `ISSUE_GLOBAL_PCT` (default 80) % of pages (and at least 3 pages) are global (`G1…`), groups on 2+ pages are repeated (`R1…`), and single-page groups are `P1…`. Sorted by severity, then page count.
+- In `summary.html`, a comment section whose every issue on that page is global collapses to "Affected by global issue G3, G4". Each row shows issue badges that link to `issues.html#id`.
+
+### AI review (`ai-judge.js`, optional)
+
+- `AI_PROVIDER=ollama` (local, free; default model `qwen2.5:7b`; images only with `AI_VISION_MODEL`) or `gemini` (free tier; `GEMINI_API_KEY`; default `gemini-2.5-flash`, also reviews images). Default `none`.
+- Reviews only pages whose strict content or image column is No. Content gets the missing, extra, and reworded blocks plus both page texts. Images get the unmatched images and the other side's images, re-encoded to JPEG through Playwright.
+- Never sent: visible markup on stage, broken stage images, live images that could not load, image-cap or placeholder cases, more than 4 unmatched images, or a side with no images to match.
+- The AI must answer strict JSON. A column becomes `Yes (AI)` only when `sameContent` is true, `lostItems` is empty, and `confidence >= AI_MIN_CONFIDENCE` (default 0.85). Otherwise it stays No and the reason and lost items are added to the comment under "AI review".
+- Answers are cached in `reports/content-compare/.ai-cache.json` by input hash.
+- SEO, URL, header, and footer are never AI-reviewed.
+
 ## Verdicts
 
-Per path: `PASS` only when content, image, SEO, URL, header, and footer are all Yes. Otherwise `FAIL`. `ERROR` when a fingerprint is missing. Do not mark `PASS` if stage returned login or 403.
+Per path: `PASS` only when content, image, SEO, URL, Redirect, Header, and Footer are all Yes (Redirect `N/A`, and `Not checked` on any column, also pass; Header / Footer are `Not checked` when `COMPARE_HEADER` / `COMPARE_FOOTER` is `false`). `PASS (AI-verified)` when every verdict column is Yes or `Yes (AI)`. Otherwise `FAIL`. `ERROR` when a fingerprint is missing. Do not mark `PASS` if stage returned login or 403. The strict columns and verdict before AI are always kept in `diff.strict`, and the AI answers are kept in `diff.ai`.
 
 `by-path/{slug}.json` shape:
 
@@ -151,6 +195,9 @@ Per path: `PASS` only when content, image, SEO, URL, header, and footer are all 
   "pageType": null,
   "liveUrl": "https://live.example/about",
   "stageUrl": "https://stage.example/about",
+  "stageFinalUrl": "https://stage.example/about-us",
+  "redirect": { "live": {}, "stage": { "hops": [{ "url": "…/about", "status": 301 }], "finalStatus": 200 } },
+  "resolvedLinks": {},
   "live": {},
   "stage": {},
   "diff": {
@@ -158,6 +205,7 @@ Per path: `PASS` only when content, image, SEO, URL, header, and footer are all 
     "imageMatch": "No",
     "seoMatch": "Yes",
     "urlMatch": "Yes",
+    "redirectMatch": "Yes",
     "headerMatch": "Yes",
     "footerMatch": "Yes",
     "comment": "image[0] alt differs",
@@ -173,13 +221,15 @@ Write under `reports/content-compare/{YYYY-MM-DD}/{HHmmss}/`:
 | File | Purpose |
 |------|---------|
 | `manifest.json` | hosts, paths, authStatus, started/finished |
-| `by-path/{slug}.json` | fingerprints, `pageType`, `visual` (image hashes + distance matrix), diff (six Yes/No columns, structured comment (numbered sections such as "1. Images", "- " sub-headings with Live/Stage lines, up to 5 items then "N more", and a Notes section for scope and closed popups), full `details` lists, verdict) |
+| `by-path/{slug}.json` | fingerprints, `pageType`, `stageFinalUrl`, `redirect` (live and stage chains), `resolvedLinks`, `visual` (image hashes + distance matrix), diff (seven match columns, structured comment (numbered sections such as "1. Images", "- " sub-headings with Live/Stage lines, up to 5 items then "N more", and a Notes section for scope and closed popups), full `details` lists, verdict) |
 | `summary.json` | rows plus pass/fail counts |
-| `summary.md` | markdown table: Page, Content match, Image match, SEO Tags match, URL match, Header match, Footer match, Comment, Screenshots |
-| `summary.html` | same table, Yes/No colored, "Press release" tag on the page, live/stage screenshot thumbnails |
-| `dashboard.html` | count cards for total pages and each match column |
+| `summary.md` | markdown table: Page (with "Stage → final path" when redirected), Content match, Image match, SEO Tags match, URL match, Redirect, Header match, Footer match, Comment, Screenshots |
+| `summary.html` | same table plus Verdict column, Yes / Yes (AI) / No / N/A colored, stage final URL link under the page, "Press release" tag, issue badges per page, filters (verdict, match columns, issue group id), live/stage screenshot thumbnails |
+| `issues.json` | issue groups (`id`, `signature`, `title`, `section`, `category`, `severity`, `scope`, `pages`, `samples`, `items`, `aiVerifiedPages`) and `pages` → group ids |
+| `issues.html` | groups split into Global / Repeated / Page-specific with severity, category, page count, items, live vs stage samples, links to rows; filters by severity, category, text |
+| `dashboard.html` | verdict cards (PASS, PASS (AI-verified), FAIL, ERROR), match-column cards (with AI counts; Redirect shows redirected / N/A / No), top issue groups |
 | `screenshots/{slug}/` | FAIL evidence only (JPEG): up to 8 `el-NN-live.jpg` / `el-NN-stage.jpg` crops of differing text blocks, images, and links (element outlined in red), plus `live-full.jpg` / `stage-full.jpg` when `COMPARE_FULL_SCREENSHOTS=true` |
 
 ## After the batch
 
-`npm run content-compare` already writes `summary.json`, `summary.md`, and `summary.html`. Tell the user the run folder path, the `summary.html` path, and pass/fail counts. Offer to continue the next batch of paths if inventory remains.
+`npm run content-compare` already writes `summary.json`, `summary.md`, `summary.html`, `issues.json`, `issues.html`, and `dashboard.html`. Tell the user the run folder path, the `summary.html` and `issues.html` paths, pass / AI-verified / fail counts, and the top global issues. Offer to continue the next batch of paths if inventory remains. After changing compare rules, re-run `npm run content-compare:analyze -- <run-dir>` instead of crawling again.

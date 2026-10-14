@@ -1,6 +1,7 @@
 import type {
   CoreWebVitals,
   FieldExperienceMetrics,
+  LighthouseA11yAudits,
   LighthousePageReport,
   LighthouseScores,
   PerfProvider
@@ -260,4 +261,114 @@ function escapeHtml(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+const MAX_AUDIT_NODES = 15;
+
+interface LhrAudit {
+  id?: string;
+  title?: string;
+  description?: string;
+  score?: number | null;
+  scoreDisplayMode?: string;
+  details?: { items?: Array<{ node?: Record<string, unknown> }> };
+}
+
+interface LhrShape {
+  lighthouseVersion?: string;
+  fetchTime?: string;
+  finalDisplayedUrl?: string;
+  finalUrl?: string;
+  audits?: Record<string, LhrAudit>;
+  categories?: Record<string, { auditRefs?: Array<{ id: string; weight?: number; group?: string }> }>;
+  categoryGroups?: Record<string, { title?: string }>;
+}
+
+/** The LHR object itself, whether given a PSI payload (`lighthouseResult`) or an LHR. */
+export function unwrapLhr(payload: unknown): LhrShape | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  if (record.lighthouseResult && typeof record.lighthouseResult === "object") {
+    return record.lighthouseResult as LhrShape;
+  }
+  return record.audits && record.categories ? (record as LhrShape) : null;
+}
+
+/** Accessibility category audits split into failed / manual / passed / not applicable. */
+export function extractA11yAudits(payload: unknown): LighthouseA11yAudits | null {
+  const lhr = unwrapLhr(payload);
+  const refs = lhr?.categories?.accessibility?.auditRefs;
+  if (!lhr?.audits || !refs) {
+    return null;
+  }
+  const result: LighthouseA11yAudits = { failed: [], manual: [], passed: [], notApplicable: [] };
+  for (const ref of refs) {
+    const audit = lhr.audits[ref.id];
+    if (!audit) {
+      continue;
+    }
+    const title = stripMarkdown(audit.title ?? ref.id);
+    const mode = audit.scoreDisplayMode ?? "";
+    if (mode === "manual") {
+      result.manual.push({ id: ref.id, title });
+    } else if (mode === "notApplicable") {
+      result.notApplicable.push({ id: ref.id, title });
+    } else if (typeof audit.score === "number" && audit.score >= 1) {
+      result.passed.push({ id: ref.id, title });
+    } else if (mode === "binary" || mode === "numeric" || mode === "metricSavings") {
+      const items = audit.details?.items ?? [];
+      result.failed.push({
+        id: ref.id,
+        title,
+        description: stripMarkdown(audit.description ?? ""),
+        learnMoreUrl: firstLink(audit.description ?? ""),
+        score: typeof audit.score === "number" ? audit.score : null,
+        weight: ref.weight ?? 0,
+        group: ref.group ? lhr.categoryGroups?.[ref.group]?.title ?? ref.group : null,
+        nodeCount: items.length,
+        nodes: items.slice(0, MAX_AUDIT_NODES).map((item) => {
+          const node = item.node ?? {};
+          return {
+            selector: stringOf(node.selector),
+            snippet: stringOf(node.snippet),
+            label: stringOf(node.nodeLabel),
+            explanation: stringOf(node.explanation)
+          };
+        })
+      });
+    }
+  }
+  result.failed.sort((a, b) => b.weight - a.weight || a.id.localeCompare(b.id));
+  return result;
+}
+
+/** Small LHR stub kept in consolidated.json so version lookups keep working without the full payload. */
+export function lhrStub(payload: unknown): Record<string, unknown> | null {
+  const lhr = unwrapLhr(payload);
+  if (!lhr) {
+    return null;
+  }
+  return {
+    version: lhr.lighthouseVersion ?? null,
+    fetchTime: lhr.fetchTime ?? null,
+    finalUrl: lhr.finalDisplayedUrl ?? lhr.finalUrl ?? null
+  };
+}
+
+function stringOf(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function firstLink(markdown: string): string | null {
+  return markdown.match(/\]\((https?:\/\/[^)\s]+)\)/)?.[1] ?? null;
+}
+
+function stripMarkdown(markdown: string): string {
+  return markdown
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\s*Learn (more|how)[^.]*\.?\s*$/i, "")
+    .trim();
 }

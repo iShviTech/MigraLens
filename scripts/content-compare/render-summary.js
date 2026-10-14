@@ -8,13 +8,16 @@
  */
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { CHROME_NOT_CHECKED, pathToSlug } from "./diff-fingerprints.js";
 
 const COLUMNS = [
   ["page", "Page"],
+  ["verdict", "Verdict"],
   ["contentMatch", "Content match"],
   ["imageMatch", "Image match"],
   ["seoMatch", "SEO Tags match"],
   ["urlMatch", "URL match"],
+  ["redirectMatch", "Redirect"],
   ["headerMatch", "Header match"],
   ["footerMatch", "Footer match"],
   ["comment", "Comment"],
@@ -22,9 +25,22 @@ const COLUMNS = [
 ];
 
 const NOT_CHECKED = "N/A";
+const REDIRECT_NOT_CHECKED = "Not checked";
+const REDIRECT_VALUES = ["Yes", "No", "N/A", REDIRECT_NOT_CHECKED];
+
+function pathOf(url) {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "";
+  }
+}
+const AI_YES = "Yes (AI)";
+const AI_PASS = "PASS (AI-verified)";
+const VERDICTS = ["PASS", AI_PASS, "FAIL", "ERROR"];
 
 function yesNo(value, fallbackOk) {
-  if (value === "Yes" || value === "No") return value;
+  if (value === "Yes" || value === "No" || value === AI_YES) return value;
   if (typeof fallbackOk === "boolean") return fallbackOk ? "Yes" : "No";
   return "No";
 }
@@ -47,25 +63,59 @@ function rowFromRecord(data, filename) {
   const seoMatch = yesNo(diff.seoMatch, diff.seoOk);
   const urlMatch = yesNo(diff.urlMatch, diff.urlsOk);
   // Runs from before header/footer compare have neither field; show N/A instead of a false "No".
+  // "Not checked" means COMPARE_HEADER / COMPARE_FOOTER was off for this run.
   const chromeChecked = "headerMatch" in diff || "headerOk" in diff;
-  const headerMatch = chromeChecked ? yesNo(diff.headerMatch, diff.headerOk) : NOT_CHECKED;
-  const footerMatch = chromeChecked ? yesNo(diff.footerMatch, diff.footerOk) : NOT_CHECKED;
-  const allYes = [contentMatch, imageMatch, seoMatch, urlMatch, headerMatch, footerMatch].every(
-    (value) => value === "Yes" || value === NOT_CHECKED
+  const chromeValue = (value, ok) => (value === CHROME_NOT_CHECKED ? value : chromeChecked ? yesNo(value, ok) : NOT_CHECKED);
+  const headerMatch = chromeValue(diff.headerMatch, diff.headerOk);
+  const footerMatch = chromeValue(diff.footerMatch, diff.footerOk);
+  const redirectMatch = REDIRECT_VALUES.includes(diff.redirectMatch) ? diff.redirectMatch : REDIRECT_NOT_CHECKED;
+  const allYes = [contentMatch, imageMatch, seoMatch, urlMatch, redirectMatch, headerMatch, footerMatch].every(
+    (value) => value === "Yes" || value === AI_YES || value === NOT_CHECKED || value === REDIRECT_NOT_CHECKED
   );
+  const finalUrl = data.stageFinalUrl || data.redirect?.stage?.finalUrl || "";
+  const finalPath = pathOf(finalUrl);
   return {
     page: String(page),
     pageType: data.pageType || diff.pageType || null,
+    stageFinalUrl: finalPath && finalPath !== pathOf(data.stageUrl) ? finalUrl : null,
     contentMatch,
     imageMatch,
     seoMatch,
     urlMatch,
+    redirectMatch,
     headerMatch,
     footerMatch,
     comment,
     screenshots: data.screenshots || null,
     verdict: diff.verdict || data.verdict || (allYes ? "PASS" : "FAIL")
   };
+}
+
+const SECTION_HEAD = /^\d+\.\s(.+)$/;
+
+/** Comment sections whose every issue on this page is global become one pointer line to issues.html. */
+function collapseGlobalSections(comment, groups) {
+  const bySection = new Map();
+  for (const group of groups) bySection.set(group.section, [...(bySection.get(group.section) || []), group]);
+  return String(comment || "")
+    .split("\n\n")
+    .map((block) => {
+      const head = block.split("\n")[0];
+      const match = head.match(SECTION_HEAD);
+      const list = match ? bySection.get(match[1]) : null;
+      if (!list?.length || !list.every((group) => group.scope === "global")) return block;
+      return `${head}\n- Affected by global issue ${list.map((group) => group.id).join(", ")} (details in issues.html)`;
+    })
+    .join("\n\n");
+}
+
+async function loadIssues(dir) {
+  try {
+    const issues = JSON.parse(await readFile(path.join(dir, "issues.json"), "utf8"));
+    return { pages: issues.pages || {}, byId: new Map((issues.groups || []).map((group) => [group.id, group])) };
+  } catch {
+    return null;
+  }
 }
 
 function screenshotsMarkdown(shots) {
@@ -132,6 +182,10 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
+function countsLine(counts) {
+  return `${counts.pass} pass, ${counts.aiVerified || 0} AI-verified, ${counts.fail} fail, ${counts.error} error (${counts.total} pages).`;
+}
+
 function renderMarkdown(summary) {
   const header = COLUMNS.map(([, label]) => label).join(" | ");
   const rule = COLUMNS.map(() => "---").join(" | ");
@@ -140,7 +194,7 @@ function renderMarkdown(summary) {
     "",
     `Generated ${summary.generatedAt}`,
     "",
-    `${summary.counts.pass} pass, ${summary.counts.fail} fail, ${summary.counts.error} error (${summary.counts.total} pages).`,
+    countsLine(summary.counts),
     "",
     `| ${header} |`,
     `| ${rule} |`
@@ -149,7 +203,12 @@ function renderMarkdown(summary) {
     const cells = COLUMNS.map(([key]) => {
       if (key === "screenshots") return escapeMd(screenshotsMarkdown(row[key]));
       if (key === "comment") return escapeMd(commentMarkdown(row[key]));
-      if (key === "page" && row.pageType) return escapeMd(`${row.page} (${pageTypeLabel(row.pageType)})`);
+      if (key === "page") {
+        const type = row.pageType ? ` (${pageTypeLabel(row.pageType)})` : "";
+        const ids = row.issues?.length ? `\nIssues: ${row.issues.map((group) => group.id).join(", ")}` : "";
+        const target = row.stageFinalUrl ? `\nStage → ${pathOf(row.stageFinalUrl)}` : "";
+        return escapeMd(`${row.page}${type}${target}${ids}`);
+      }
       return escapeMd(row[key]);
     });
     lines.push(`| ${cells.join(" | ")} |`);
@@ -163,8 +222,30 @@ function pageTypeLabel(pageType) {
 }
 
 function matchCell(value) {
-  const kind = value === "Yes" ? "yes" : value === NOT_CHECKED ? "na" : "no";
+  const kind = value === "Yes" ? "yes" : value === AI_YES ? "ai" : value === NOT_CHECKED || value === REDIRECT_NOT_CHECKED ? "na" : "no";
   return `<td class="${kind}">${escapeHtml(value)}</td>`;
+}
+
+function verdictCell(value) {
+  const kind = { PASS: "yes", [AI_PASS]: "ai", FAIL: "no", ERROR: "no" }[value] || "na";
+  return `<td class="${kind} verdict">${escapeHtml(value)}</td>`;
+}
+
+const MAX_BADGES = 12;
+
+function issueBadges(issues) {
+  if (!issues?.length) return "";
+  const shown = issues
+    .slice(0, MAX_BADGES)
+    .map(
+      (group) =>
+        `<a class="badge ${escapeHtml(group.severity)}${group.scope === "global" ? " global" : ""}" href="issues.html#${escapeHtml(group.id)}" title="${escapeHtml(
+          `${group.severity}: ${group.title}`
+        )}">${escapeHtml(group.id)}</a>`
+    )
+    .join("");
+  const more = issues.length > MAX_BADGES ? `<span class="badge more">+${issues.length - MAX_BADGES}</span>` : "";
+  return `<div class="badges">${shown}${more}</div>`;
 }
 
 function figure(caption, href, className) {
@@ -195,23 +276,33 @@ function screenshotsHtml(shots) {
   return `${full}<details><summary>${elements.length} differing element${elements.length === 1 ? "" : "s"}</summary>${items}</details>`;
 }
 
-const MATCH_KEYS = ["contentMatch", "imageMatch", "seoMatch", "urlMatch", "headerMatch", "footerMatch"];
+const MATCH_KEYS = ["contentMatch", "imageMatch", "seoMatch", "urlMatch", "redirectMatch", "headerMatch", "footerMatch"];
 
 function filterBarHtml() {
   const selects = COLUMNS.filter(([key]) => MATCH_KEYS.includes(key))
-    .map(
-      ([key, label]) => `<label>${escapeHtml(label)}
-        <select data-filter="${key}">
-          <option value="">All</option>
-          <option value="Yes">Yes</option>
-          <option value="No">No</option>
-        </select>
-      </label>`
-    )
+    .map(([key, label]) => {
+      const values =
+        key === "redirectMatch"
+          ? REDIRECT_VALUES
+          : key === "headerMatch" || key === "footerMatch"
+            ? ["Yes", "No", CHROME_NOT_CHECKED]
+            : ["Yes", AI_YES, "No"];
+      const options = values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
+      return `<label>${escapeHtml(label)}
+        <select data-filter="${key}"><option value="">All</option>${options}</select>
+      </label>`;
+    })
     .join("\n      ");
+  const verdicts = VERDICTS.map((verdict) => `<option value="${escapeHtml(verdict)}">${escapeHtml(verdict)}</option>`).join("");
   return `<div class="filters">
       <label>Page
         <input type="search" data-filter="page" placeholder="Search path" />
+      </label>
+      <label>Issue group
+        <input type="search" data-filter="issues" placeholder="e.g. G3" size="8" />
+      </label>
+      <label>Verdict
+        <select data-filter="verdict"><option value="">All</option>${verdicts}</select>
       </label>
       ${selects}
       <button type="button" id="filter-reset">Reset</button>
@@ -228,9 +319,11 @@ const FILTER_SCRIPT = `
       const active = controls.map((el) => [el.dataset.filter, el.value.trim().toLowerCase()]).filter(([, value]) => value);
       let shown = 0;
       for (const row of rows) {
-        const visible = active.every(([key, value]) =>
-          key === "page" ? row.dataset.page.includes(value) : row.dataset[key.toLowerCase()] === value
-        );
+        const visible = active.every(([key, value]) => {
+          if (key === "page") return row.dataset.page.includes(value);
+          if (key === "issues") return row.dataset.issues.split(" ").includes(value);
+          return row.dataset[key.toLowerCase()] === value;
+        });
         row.hidden = !visible;
         if (visible) shown += 1;
       }
@@ -245,18 +338,26 @@ const FILTER_SCRIPT = `
   })();
 `;
 
+function finalUrlHtml(url) {
+  if (!url) return "";
+  return `<div class="final">Stage → <a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(pathOf(url))}</a></div>`;
+}
+
 function renderHtml(summary) {
   const head = COLUMNS.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join("");
   const body = summary.rows
     .map((row) => {
       const tag = row.pageType ? ` <span class="tag">${escapeHtml(pageTypeLabel(row.pageType))}</span>` : "";
-      const data = MATCH_KEYS.map((key) => `data-${key.toLowerCase()}="${escapeHtml(String(row[key] || "").toLowerCase())}"`).join(" ");
-      return `<tr data-page="${escapeHtml(row.page.toLowerCase())}" ${data}>
-        <td>${escapeHtml(row.page)}${tag}</td>
+      const data = [...MATCH_KEYS, "verdict"].map((key) => `data-${key.toLowerCase()}="${escapeHtml(String(row[key] || "").toLowerCase())}"`).join(" ");
+      const issueIds = (row.issues || []).map((group) => group.id.toLowerCase()).join(" ");
+      return `<tr id="row-${escapeHtml(pathToSlug(row.page))}" data-page="${escapeHtml(row.page.toLowerCase())}" data-issues="${escapeHtml(issueIds)}" ${data}>
+        <td>${escapeHtml(row.page)}${tag}${finalUrlHtml(row.stageFinalUrl)}${issueBadges(row.issues)}</td>
+        ${verdictCell(row.verdict)}
         ${matchCell(row.contentMatch)}
         ${matchCell(row.imageMatch)}
         ${matchCell(row.seoMatch)}
         ${matchCell(row.urlMatch)}
+        ${matchCell(row.redirectMatch)}
         ${matchCell(row.headerMatch)}
         ${matchCell(row.footerMatch)}
         <td class="comment">${commentHtml(row.comment)}</td>
@@ -279,7 +380,21 @@ function renderHtml(summary) {
     th { background: #f5f5f4; font-size: 0.85rem; }
     td.yes { color: #166534; font-weight: 600; }
     td.no { color: #b91c1c; font-weight: 600; }
+    td.ai { color: #6d28d9; font-weight: 600; }
     td.na { color: #a8a29e; }
+    td.verdict { white-space: nowrap; }
+    tr { scroll-margin-top: 140px; }
+    tr:target td { background: #fffbeb; }
+    .badges { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 6px; max-width: 18rem; }
+    .badge { font-size: 0.68rem; font-weight: 700; font-family: ui-monospace, monospace; padding: 0 5px; border-radius: 7px; text-decoration: none; border: 1px solid transparent; }
+    .badge.critical { background: #fee2e2; color: #991b1b; }
+    .badge.high { background: #ffedd5; color: #9a3412; }
+    .badge.medium { background: #fef9c3; color: #854d0e; }
+    .badge.low { background: #e0f2fe; color: #075985; }
+    .badge.info, .badge.more { background: #f5f5f4; color: #57534e; }
+    .badge.global { border-style: dashed; border-color: currentColor; }
+    .final { margin-top: 4px; font-size: 0.75rem; color: #57534e; word-break: break-all; max-width: 18rem; }
+    .final a { color: #1d4ed8; }
     .tag { display: inline-block; margin-top: 4px; padding: 1px 6px; border-radius: 9px; background: #e0e7ff; color: #3730a3; font-size: 0.7rem; font-weight: 600; white-space: nowrap; }
     td.comment { min-width: 30rem; max-width: 44rem; font-weight: 400; color: #44403c; font-size: 0.85rem; line-height: 1.4; }
     td.comment .c-section { font-weight: 700; color: #1c1917; margin-top: 12px; font-size: 0.95rem; }
@@ -310,7 +425,7 @@ function renderHtml(summary) {
 </head>
 <body>
   <h1>Content compare</h1>
-  <p>${summary.counts.pass} pass, ${summary.counts.fail} fail, ${summary.counts.error} error (${summary.counts.total} pages). Generated ${escapeHtml(summary.generatedAt)}.</p>
+  <p>${countsLine(summary.counts)} Generated ${escapeHtml(summary.generatedAt)} · <a href="issues.html">Issue groups</a> · <a href="dashboard.html">Dashboard</a></p>
   ${filterBarHtml()}
   <table>
     <thead><tr>${head}</tr></thead>
@@ -324,9 +439,9 @@ ${body}
 `;
 }
 
-/** Yes count, or null when no row in the run was checked (older runs). */
+/** Yes count, or null when no row in the run was checked (older runs, or the compare was turned off). */
 function chromeCount(rows, key) {
-  if (rows.every((row) => row[key] === NOT_CHECKED)) return null;
+  if (rows.every((row) => row[key] === NOT_CHECKED || row[key] === CHROME_NOT_CHECKED)) return null;
   return rows.filter((row) => row[key] === "Yes").length;
 }
 
@@ -350,15 +465,31 @@ export async function renderSummary(runDir) {
   }
   rows.sort((a, b) => a.page.localeCompare(b.page));
 
+  const issues = await loadIssues(dir);
+  if (issues) {
+    for (const row of rows) {
+      row.issues = (issues.pages[row.page] || []).map((id) => issues.byId.get(id)).filter(Boolean);
+      row.comment = collapseGlobalSections(row.comment, row.issues);
+    }
+  }
+
+  const yesCount = (key) => rows.filter((row) => row[key] === "Yes" || row[key] === AI_YES).length;
+  const aiCount = (key) => rows.filter((row) => row[key] === AI_YES).length;
   const counts = {
     total: rows.length,
     pass: rows.filter((row) => row.verdict === "PASS").length,
+    aiVerified: rows.filter((row) => row.verdict === AI_PASS).length,
     fail: rows.filter((row) => row.verdict === "FAIL").length,
     error: rows.filter((row) => row.verdict === "ERROR").length,
-    contentMatch: rows.filter((row) => row.contentMatch === "Yes").length,
-    imageMatch: rows.filter((row) => row.imageMatch === "Yes").length,
-    seoMatch: rows.filter((row) => row.seoMatch === "Yes").length,
-    urlMatch: rows.filter((row) => row.urlMatch === "Yes").length,
+    contentMatch: yesCount("contentMatch"),
+    contentMatchAi: aiCount("contentMatch"),
+    imageMatch: yesCount("imageMatch"),
+    imageMatchAi: aiCount("imageMatch"),
+    seoMatch: yesCount("seoMatch"),
+    urlMatch: yesCount("urlMatch"),
+    redirectMatch: rows.every((row) => row.redirectMatch === REDIRECT_NOT_CHECKED) ? null : yesCount("redirectMatch"),
+    redirectNa: rows.filter((row) => row.redirectMatch === "N/A").length,
+    redirectNo: rows.filter((row) => row.redirectMatch === "No").length,
     headerMatch: chromeCount(rows, "headerMatch"),
     footerMatch: chromeCount(rows, "footerMatch")
   };
@@ -366,13 +497,17 @@ export async function renderSummary(runDir) {
   const summary = {
     generatedAt: new Date().toISOString(),
     counts,
-    rows: rows.map(({ page, pageType, contentMatch, imageMatch, seoMatch, urlMatch, headerMatch, footerMatch, comment, screenshots }) => ({
+    rows: rows.map(({ page, pageType, stageFinalUrl, verdict, issues: groups, contentMatch, imageMatch, seoMatch, urlMatch, redirectMatch, headerMatch, footerMatch, comment, screenshots }) => ({
       page,
       pageType,
+      stageFinalUrl,
+      verdict,
+      issues: groups || [],
       contentMatch,
       imageMatch,
       seoMatch,
       urlMatch,
+      redirectMatch,
       headerMatch,
       footerMatch,
       comment,
@@ -380,7 +515,11 @@ export async function renderSummary(runDir) {
     }))
   };
 
-  await writeFile(path.join(dir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
+  const forJson = {
+    ...summary,
+    rows: summary.rows.map((row) => ({ ...row, issues: row.issues.map((group) => group.id) }))
+  };
+  await writeFile(path.join(dir, "summary.json"), `${JSON.stringify(forJson, null, 2)}\n`);
   await writeFile(path.join(dir, "summary.md"), renderMarkdown(summary));
   await writeFile(path.join(dir, "summary.html"), renderHtml(summary));
   return summary;

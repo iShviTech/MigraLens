@@ -1,5 +1,5 @@
 import type { AppConfig } from "../config/env.js";
-import type { LighthousePageReport } from "../types.js";
+import type { LighthouseDevice, LighthousePageReport, PerfAuditResult } from "../types.js";
 import { categoryForUrl } from "../crawler/categorize.js";
 import { McpClientPool, McpStdioClient } from "./client.js";
 import { extractCoreWebVitals, extractScores, renderPerfHtml } from "../perf/extract.js";
@@ -8,11 +8,13 @@ export function createLighthousePool(config: AppConfig): McpClientPool {
   return new McpClientPool(config.CONCURRENCY_LIMIT, () => new McpStdioClient(config.LIGHTHOUSE_MCP_CMD));
 }
 
+/** Lighthouse via MCP: scores and metrics only, so no full LHR (no a11y audits or official report). */
 export async function auditUrlWithLighthouse(
   pool: McpClientPool,
   config: AppConfig,
-  url: string
-): Promise<LighthousePageReport> {
+  url: string,
+  device: LighthouseDevice = config.LIGHTHOUSE_DEVICE
+): Promise<PerfAuditResult> {
   const payload = await pool.withClient(async (client) => {
     const toolName = await resolveToolName(client, config.LIGHTHOUSE_MCP_TOOL, ["run_audit", "lighthouse_audit"]);
     return client.callTool(
@@ -20,7 +22,7 @@ export async function auditUrlWithLighthouse(
       {
         url,
         categories: config.lighthouseCategories,
-        device: config.LIGHTHOUSE_DEVICE,
+        device,
         throttling: config.LIGHTHOUSE_THROTTLING
       },
       {
@@ -32,15 +34,18 @@ export async function auditUrlWithLighthouse(
   });
 
   return {
-    url,
-    category: categoryForUrl(url),
-    scannedAt: new Date().toISOString(),
-    device: config.LIGHTHOUSE_DEVICE,
-    provider: "lighthouse",
-    scores: extractScores(payload),
-    coreWebVitals: extractCoreWebVitals(payload),
-    fieldMetrics: null,
-    raw: payload
+    report: {
+      url,
+      category: categoryForUrl(url),
+      scannedAt: new Date().toISOString(),
+      device,
+      provider: "lighthouse",
+      scores: extractScores(payload),
+      coreWebVitals: extractCoreWebVitals(payload),
+      fieldMetrics: null,
+      raw: payload
+    },
+    lhr: null
   };
 }
 

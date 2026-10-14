@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { runAccessibilityAudit } from "../audit/accessibility.js";
 import { runPerformanceAudit } from "../audit/performance.js";
 import { loadConfig } from "../config/env.js";
-import { writeRunHtmlReports } from "../report/generate.js";
+import { writeRootSummaryReport, writeRunHtmlReports } from "../report/generate.js";
 import { logInfo } from "../utils/logger.js";
 import { createAuditRunFromScrape } from "../utils/run-context.js";
 
@@ -30,26 +30,24 @@ async function main(): Promise<void> {
   await runPerformanceAudit(config, ctx, { writeReports: false });
 
   const reports = await writeRunHtmlReports(config, ctx);
-  await generateRootReports();
+  const rootSummary = await writeRootSummaryReport(config, ctx);
+  await generateRootComparisonReport();
 
   logInfo("Audit pipeline finished", {
     runDir: ctx.runDir,
     ...reports,
-    rootSummary: path.join(config.OUTPUT_DIR, "summary-report.html"),
+    rootSummary,
     rootComparison: path.join(config.OUTPUT_DIR, "comparison-report.html")
   });
 }
 
-async function generateRootReports(): Promise<void> {
-  const scripts = ["scripts/generate-report.js", "scripts/generate-comparison-report.js"];
-  for (const script of scripts) {
-    const scriptPath = path.join(PROJECT_ROOT, script);
-    logInfo("Generating root report", { script });
-    await execFileAsync(process.execPath, [scriptPath], {
-      cwd: PROJECT_ROOT,
-      maxBuffer: 10 * 1024 * 1024
-    });
-  }
+async function generateRootComparisonReport(): Promise<void> {
+  const script = "scripts/generate-comparison-report.js";
+  logInfo("Generating root report", { script });
+  await execFileAsync(process.execPath, [path.join(PROJECT_ROOT, script)], {
+    cwd: PROJECT_ROOT,
+    maxBuffer: 10 * 1024 * 1024
+  });
 }
 
 main().catch((error) => {
