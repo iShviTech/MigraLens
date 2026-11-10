@@ -1,14 +1,12 @@
 import { chromium, type Browser, type Page } from "playwright";
 import type { AppConfig } from "../config/env.js";
+import { ASSET_EXTENSIONS, DOCUMENT_EXTENSIONS, normalizeUrl } from "../links/classify.js";
 import type { CategorizedUrlInventory, CrawlMeta, FlatUrlInventory } from "../types.js";
 import { logInfo, logWarn } from "../utils/logger.js";
 import { withRetry } from "../utils/retry.js";
 import { groupUrlsByCategory } from "./categorize.js";
 
-/** Binary / office docs — gated by CRAWL_DOCUMENT_LINKS. */
-const DOCUMENT_EXTENSIONS = /\.(pdf|docx?|xlsx?|pptx?|zip)(\?|$)/i;
-/** Static assets — always skipped (not useful for page audits). */
-const ASSET_EXTENSIONS = /\.(jpe?g|png|gif|webp|svg|mp4|mp3|css|js|ico|woff2?|ttf)(\?|$)/i;
+export { normalizeUrl } from "../links/classify.js";
 
 export interface CrawlResult {
   flat: FlatUrlInventory;
@@ -16,7 +14,12 @@ export interface CrawlResult {
   meta: CrawlMeta;
 }
 
-export async function crawlSite(config: AppConfig): Promise<CrawlResult> {
+export interface CrawlSiteOptions {
+  /** When true, never follow off-origin links regardless of CRAWL_EXTERNAL_LINKS. */
+  forceInternalOnly?: boolean;
+}
+
+export async function crawlSite(config: AppConfig, options: CrawlSiteOptions = {}): Promise<CrawlResult> {
   const origin = new URL(config.TARGET_URL).origin;
   const startUrl = normalizeUrl(config.TARGET_URL, config.INCLUDE_QUERY_PARAMS);
   const discovered = new Set<string>([startUrl]);
@@ -26,6 +29,11 @@ export async function crawlSite(config: AppConfig): Promise<CrawlResult> {
   let skippedExternal = 0;
   let skippedNonHttp = 0;
   let skippedDocuments = 0;
+  const forceInternalOnly = options.forceInternalOnly === true;
+  // Internal page inventory must stay HTML pages only — never queue PDFs/docs as crawl targets.
+  const crawlConfig: AppConfig = forceInternalOnly
+    ? { ...config, CRAWL_EXTERNAL_LINKS: false, CRAWL_DOCUMENT_LINKS: false }
+    : config;
 
   const startedAt = new Date().toISOString();
   const browser = await chromium.launch({ headless: config.PLAYWRIGHT_HEADLESS });
@@ -47,7 +55,7 @@ export async function crawlSite(config: AppConfig): Promise<CrawlResult> {
         continue;
       }
       visited.add(next.url);
-      logInfo("Crawling page", { url: next.url, depth: next.depth, visited: visited.size });
+      logInfo("Crawling page", { url: next.url, depth: next.depth, visited: visited.size, forceInternalOnly });
 
       const page = await context.newPage();
       try {
@@ -65,7 +73,7 @@ export async function crawlSite(config: AppConfig): Promise<CrawlResult> {
         });
 
         for (const href of hrefs) {
-          const classified = classifyHref(href, origin, config);
+          const classified = classifyHref(href, origin, crawlConfig);
           if (classified.kind === "external") {
             skippedExternal += 1;
             continue;
@@ -192,20 +200,6 @@ function classifyHref(href: string, origin: string, config: AppConfig): Classifi
   }
 
   return { kind: "crawl", url: normalizeUrl(parsed.toString(), config.INCLUDE_QUERY_PARAMS) };
-}
-
-export function normalizeUrl(url: string, includeQuery: boolean): string {
-  const parsed = new URL(url);
-  parsed.hash = "";
-  if (!includeQuery) {
-    parsed.search = "";
-  }
-  let pathname = parsed.pathname;
-  if (pathname.length > 1) {
-    pathname = pathname.replace(/\/+$/, "");
-  }
-  parsed.pathname = pathname || "/";
-  return parsed.toString();
 }
 
 async function closeBrowser(browser: Browser): Promise<void> {

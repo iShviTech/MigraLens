@@ -62,6 +62,12 @@ const envSchema = z.object({
   /** Required when PERF_PROVIDER=pagespeed. Get a key from Google Cloud Console. */
   PAGESPEED_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
   CONCURRENCY_LIMIT: optionalNumber.pipe(z.number().int().min(1).default(2)),
+  /** Parallel visible Chrome windows for `npm run navigatePage` (default 1). */
+  NAVIGATE_PAGE_CONCURRENCY: optionalNumber.pipe(z.number().int().min(1).default(1)),
+  /** Dwell time after each page finishes loading (default 30s). */
+  NAVIGATE_PAGE_DWELL_MS: optionalNumber.pipe(z.number().int().positive().default(30_000)),
+  /** Navigation timeout per URL for navigatePage. */
+  NAVIGATE_PAGE_NAV_TIMEOUT_MS: optionalNumber.pipe(z.number().int().positive().default(60_000)),
   INCLUDE_QUERY_PARAMS: booleanFromEnv.pipe(z.boolean().default(false)),
   /** When true, follow off-origin http(s) links (bounded by MAX_CRAWL_DEPTH / MAX_URLS). */
   CRAWL_EXTERNAL_LINKS: booleanFromEnv.pipe(z.boolean().default(false)),
@@ -84,7 +90,17 @@ const envSchema = z.object({
   LIGHTHOUSE_CATEGORIES: z.string().default("performance,accessibility,best-practices,seo"),
   COMPARE_FROM: z.preprocess(emptyToUndefined, z.string().optional()),
   COMPARE_TO: z.preprocess(emptyToUndefined, z.string().optional()),
-  RUN_ID: z.preprocess(emptyToUndefined, z.string().optional())
+  RUN_ID: z.preprocess(emptyToUndefined, z.string().optional()),
+  /** Preferred public live origin for `npm run check-links` (falls back to TARGET_URL). */
+  LIVE_URL: z.preprocess(emptyToUndefined, z.string().url().optional()),
+  /** Optional comma-separated paths for check-links; empty = all urls-flat + urls-with-external. */
+  LINK_CHECK_PATHS: z.preprocess(emptyToUndefined, z.string().optional()),
+  /** Parallel HTTP probes for unique link targets. */
+  LINK_CHECK_CONCURRENCY: optionalNumber.pipe(z.number().int().min(1).default(8)),
+  /** Timeout per link probe (HEAD or GET). */
+  LINK_CHECK_TIMEOUT_MS: optionalNumber.pipe(z.number().int().positive().default(15_000)),
+  /** When true (default), probe off-origin http(s) links. */
+  LINK_CHECK_INCLUDE_EXTERNAL: booleanFromEnv.pipe(z.boolean().default(true))
 });
 
 export type AppConfig = z.infer<typeof envSchema> & {

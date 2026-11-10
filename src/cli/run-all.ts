@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { runAccessibilityAudit } from "../audit/accessibility.js";
 import { runPerformanceAudit } from "../audit/performance.js";
 import { loadConfig } from "../config/env.js";
+import { writeDashboard } from "../dashboard/write.js";
 import { writeRootSummaryReport, writeRunHtmlReports } from "../report/generate.js";
 import { logInfo } from "../utils/logger.js";
 import { createAuditRunFromScrape } from "../utils/run-context.js";
@@ -32,12 +33,14 @@ async function main(): Promise<void> {
   const reports = await writeRunHtmlReports(config, ctx);
   const rootSummary = await writeRootSummaryReport(config, ctx);
   await generateRootComparisonReport();
+  const dashboard = await writeDashboard(config);
 
   logInfo("Audit pipeline finished", {
     runDir: ctx.runDir,
     ...reports,
     rootSummary,
-    rootComparison: path.join(config.OUTPUT_DIR, "comparison-report.html")
+    rootComparison: path.join(config.OUTPUT_DIR, "comparison-report.html"),
+    dashboardIndex: dashboard.indexPath
   });
 }
 

@@ -8,6 +8,32 @@ export interface FlatUrlInventory {
   urls: string[];
 }
 
+/** Kind stored in urls-with-external.json (harvested by scrape-all). */
+export type ExternalInventoryKind = "external" | "image" | "document" | "asset" | "other";
+
+export interface ExternalUrlEntry {
+  url: string;
+  kind: ExternalInventoryKind;
+  sourcePages: string[];
+}
+
+export interface ExternalUrlInventory {
+  generatedAt: string;
+  targetUrl: string;
+  origin: string;
+  sourceInventory: string;
+  count: number;
+  urls: ExternalUrlEntry[];
+  meta?: {
+    pagesVisited: number;
+    skippedResourceSeeds: number;
+    skippedInFlat: number;
+    skippedNonHttp: number;
+    skippedInternalPage: number;
+    failures: Array<{ url: string; error: string }>;
+  };
+}
+
 export interface CategoryBucket {
   category: string;
   count: number;
@@ -88,6 +114,10 @@ export interface CoreWebVitals {
   fcpMs: number | null;
   siMs: number | null;
   ttiMs: number | null;
+  /** Window load event (observedLoad) from Lighthouse metrics, ms. */
+  loadMs: number | null;
+  /** Time to first byte from Lighthouse metrics / server-response-time, ms. */
+  ttfbMs: number | null;
 }
 
 /** Optional CrUX field metrics from PageSpeed Insights (absent for local Lighthouse). */
@@ -180,6 +210,71 @@ export interface LatestScrapePointer {
   scrapedAt: string;
 }
 
+/** Lab + optional field INP values used in dual-device compare tables. */
+export interface ComparisonVitals {
+  loadMs: number | null;
+  ttfbMs: number | null;
+  lcpMs: number | null;
+  /** Lab INP when present; otherwise CrUX field INP. */
+  inpMs: number | null;
+  /** True when inpMs came from fieldMetrics rather than lab. */
+  inpIsField: boolean;
+  cls: number | null;
+  fcpMs: number | null;
+}
+
+export interface ComparisonDevicePageDelta {
+  url: string;
+  fromScores: LighthouseScores | null;
+  toScores: LighthouseScores | null;
+  deltas: LighthouseScores;
+  fromVitals: ComparisonVitals | null;
+  toVitals: ComparisonVitals | null;
+  vitalDeltas: {
+    loadMs: number | null;
+    ttfbMs: number | null;
+    lcpMs: number | null;
+    inpMs: number | null;
+    cls: number | null;
+    fcpMs: number | null;
+  };
+  /** Present when one side failed or was missing for this device. */
+  note?: string | null;
+}
+
+/** One dated run row in the spreadsheet-style comparison table (values in seconds). */
+export interface ComparisonSheetRun {
+  date: string;
+  dateLabel: string;
+  loadSec: number | null;
+  lcpSec: number | null;
+  inpSec: number | null;
+  cls: number | null;
+  fcpSec: number | null;
+  ttfbSec: number | null;
+  perf: number | null;
+  a11y: number | null;
+  bestPractices: number | null;
+  seo: number | null;
+  note?: string | null;
+}
+
+/** URL group: path header + ordered date rows for the spreadsheet table. */
+export interface ComparisonSheetUrlGroup {
+  url: string;
+  path: string;
+  runs: ComparisonSheetRun[];
+}
+
+export interface ComparisonDeviceBlock {
+  device: LighthouseDevice;
+  fromAverageScores: LighthouseScores | null;
+  toAverageScores: LighthouseScores | null;
+  pages: ComparisonDevicePageDelta[];
+  /** Spreadsheet-style URL → date rows for HTML. */
+  sheetGroups?: ComparisonSheetUrlGroup[];
+}
+
 export interface ComparisonReport {
   generatedAt: string;
   from: { date: string; runDir: string; provider?: PerfProvider };
@@ -194,10 +289,13 @@ export interface ComparisonReport {
     fixedViolations: Array<{ url: string; fingerprint: string; id: string; impact: string | null; help: string }>;
     unchangedCount: number;
   };
+  /** Primary-device score rows (legacy / markdown). Prefer performanceByDevice for HTML. */
   performance: Array<{
     url: string;
     fromScores: LighthouseScores | null;
     toScores: LighthouseScores | null;
     deltas: LighthouseScores;
   }>;
+  /** Mobile↔mobile and desktop↔desktop score + vital deltas. */
+  performanceByDevice?: ComparisonDeviceBlock[];
 }

@@ -42,13 +42,20 @@ export function latestScrapePointerPath(config: AppConfig): string {
   return path.join(resolveOutputRoot(config), ".latest-scrape.json");
 }
 
-export function inventoryPaths(config: AppConfig): { dir: string; flat: string; categorized: string; meta: string } {
+export function inventoryPaths(config: AppConfig): {
+  dir: string;
+  flat: string;
+  categorized: string;
+  meta: string;
+  external: string;
+} {
   const dir = urlInventoryDir(config);
   return {
     dir,
     flat: path.join(dir, "urls-flat.json"),
     categorized: path.join(dir, "urls-category.json"),
-    meta: path.join(dir, "crawl-meta.json")
+    meta: path.join(dir, "crawl-meta.json"),
+    external: path.join(dir, "urls-with-external.json")
   };
 }
 
@@ -117,7 +124,19 @@ export async function resolveExistingRun(config: AppConfig): Promise<RunContext>
 export function assertHasInventory(config: AppConfig): void {
   const { flat } = inventoryPaths(config);
   if (!existsSync(flat)) {
-    throw new Error(`Scrape inventory missing urls-flat.json at ${flat}. Run \`npm run scrape\` once.`);
+    throw new Error(
+      `Scrape inventory missing urls-flat.json at ${flat}. Run \`npm run scrape-internal\` (or \`npm run scrape\`) once.`
+    );
+  }
+}
+
+/** Ensures urls-with-external.json exists (from `npm run scrape-all`). */
+export function assertHasExternalInventory(config: AppConfig): void {
+  const { external } = inventoryPaths(config);
+  if (!existsSync(external)) {
+    throw new Error(
+      `External inventory missing urls-with-external.json at ${external}. Run \`npm run scrape-all\` after scrape-internal.`
+    );
   }
 }
 

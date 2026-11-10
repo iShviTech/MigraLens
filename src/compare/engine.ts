@@ -7,14 +7,19 @@ import type {
   AccessibilityConsolidatedReport,
   ComparisonReport,
   FlatUrlInventory,
-  LighthouseConsolidatedReport,
-  LighthouseScores,
   NormalizedViolation
 } from "../types.js";
 import { writeJson } from "../utils/fs.js";
 import { logInfo } from "../utils/logger.js";
 import { resolveInventoryFlatPath, resolveOutputRoot } from "../utils/run-context.js";
 import { resolveReportProvider } from "../report/shared.js";
+import { selectHistoryRuns } from "./history.js";
+import {
+  attachHistoricalSheetGroups,
+  buildPerformanceByDevice,
+  loadLighthouseByDeviceForCompare,
+  primaryDevicePerformance
+} from "./perf-delta.js";
 
 export async function compareRuns(
   config: AppConfig,
@@ -50,37 +55,33 @@ export async function compareRuns(
     .map(([, value]) => value);
   const unchangedCount = [...toMap.keys()].filter((fingerprint) => fromMap.has(fingerprint)).length;
 
-  const fromPerf = await readJsonIfExists<LighthouseConsolidatedReport>(
-    path.join(fromRun, "lighthouse", "consolidated.json")
-  );
-  const toPerf = await readJsonIfExists<LighthouseConsolidatedReport>(
-    path.join(toRun, "lighthouse", "consolidated.json")
-  );
-  const fromScores = indexScores(fromPerf);
-  const toScores = indexScores(toPerf);
-  const scoreUrls = new Set([...fromScores.keys(), ...toScores.keys()]);
-  const performance = [...scoreUrls].sort().map((url) => {
-    const before = fromScores.get(url) ?? null;
-    const after = toScores.get(url) ?? null;
-    return {
-      url,
-      fromScores: before,
-      toScores: after,
-      deltas: deltaScores(before, after)
-    };
-  });
+  const fromByDevice = await loadLighthouseByDeviceForCompare(fromRun);
+  const toByDevice = await loadLighthouseByDeviceForCompare(toRun);
+  const endpointBlocks = buildPerformanceByDevice(fromByDevice, toByDevice, fromDate, toDate);
+  const historyRuns = await selectHistoryRuns(resolveOutputRoot(config), fromDate, toDate);
+  const performanceByDevice = await attachHistoricalSheetGroups(endpointBlocks, historyRuns, toUrls);
+  const performance = primaryDevicePerformance(performanceByDevice, config.LIGHTHOUSE_DEVICE);
+
+  const fromPrimary =
+    fromByDevice[config.LIGHTHOUSE_DEVICE] ??
+    fromByDevice.desktop ??
+    fromByDevice.mobile ??
+    null;
+  const toPrimary =
+    toByDevice[config.LIGHTHOUSE_DEVICE] ?? toByDevice.desktop ?? toByDevice.mobile ?? null;
 
   const report: ComparisonReport = {
     generatedAt: new Date().toISOString(),
-    from: { date: fromDate, runDir: fromRun, provider: resolveReportProvider(fromPerf) },
-    to: { date: toDate, runDir: toRun, provider: resolveReportProvider(toPerf) },
+    from: { date: fromDate, runDir: fromRun, provider: resolveReportProvider(fromPrimary) },
+    to: { date: toDate, runDir: toRun, provider: resolveReportProvider(toPrimary) },
     urls: { added, removed, shared },
     accessibility: {
       addedViolations,
       fixedViolations,
       unchangedCount
     },
-    performance
+    performance,
+    performanceByDevice
   };
 
   const outDir = path.join(resolveOutputRoot(config), "comparisons", `${fromDate}_vs_${toDate}`);
@@ -92,13 +93,28 @@ export async function compareRuns(
 }
 
 function renderComparisonMarkdown(report: ComparisonReport): string {
-  const perfShifts = report.performance.filter((row) => row.deltas.performance !== null && row.deltas.performance !== 0);
   const fromProvider = report.from.provider ?? "lighthouse";
   const toProvider = report.to.provider ?? "lighthouse";
   const mismatchNote =
     fromProvider !== toProvider
       ? `\n> **Provider mismatch:** baseline \`${fromProvider}\` vs current \`${toProvider}\` — deltas are not directly comparable.\n`
       : "";
+
+  const deviceSections = (report.performanceByDevice ?? [])
+    .map((block) => {
+      const rows = block.pages
+        .map((row) => {
+          const load = fmtDelta(row.vitalDeltas.loadMs, "ms");
+          const lcp = fmtDelta(row.vitalDeltas.lcpMs, "ms");
+          const perf = fmtDelta(row.deltas.performance);
+          const note = row.note ? ` _(note: ${row.note})_` : "";
+          return `- ${row.url}: load ${load}, LCP ${lcp}, perf ${perf}, a11y ${fmtDelta(row.deltas.accessibility)}, SEO ${fmtDelta(row.deltas.seo)}${note}`;
+        })
+        .join("\n");
+      return `### ${capitalize(block.device)}\n\n${rows || "_no pages_"}\n`;
+    })
+    .join("\n");
+
   return `# MigraLens delta: ${report.from.date} → ${report.to.date}
 
 - From: \`${report.from.runDir}\` (provider: \`${fromProvider}\`)
@@ -123,19 +139,23 @@ ${report.accessibility.addedViolations.map((item) => `- [${item.impact ?? "unkno
 ### Fixed
 ${report.accessibility.fixedViolations.map((item) => `- [${item.impact ?? "unknown"}] ${item.id} on ${item.url} — ${item.help}`).join("\n") || "_none_"}
 
-## Performance score shifts
+## Performance by device (sorted by Load regression)
 
-${perfShifts
-  .map((row) => `- ${row.url}: performance ${fmtDelta(row.deltas.performance)}, a11y ${fmtDelta(row.deltas.accessibility)}, SEO ${fmtDelta(row.deltas.seo)}`)
-  .join("\n") || "_no score changes_"}
+${deviceSections || "_no device performance data_"}
 `;
 }
 
-function fmtDelta(value: number | null): string {
+function fmtDelta(value: number | null, suffix = ""): string {
   if (value === null) {
     return "n/a";
   }
-  return value > 0 ? `+${value}` : String(value);
+  const rounded = Math.abs(value) >= 10 || Number.isInteger(value) ? Math.round(value) : Number(value.toFixed(3));
+  const signed = value > 0 ? `+${rounded}` : String(rounded);
+  return suffix ? `${signed}${suffix}` : signed;
+}
+
+function capitalize(value: string): string {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
 }
 
 async function latestRunForDate(config: AppConfig, date: string): Promise<string> {
@@ -188,34 +208,6 @@ function indexViolations(report: AccessibilityConsolidatedReport | undefined) {
     }
   }
   return map;
-}
-
-function indexScores(report: LighthouseConsolidatedReport | undefined) {
-  const map = new Map<string, LighthouseScores>();
-  if (!report) {
-    return map;
-  }
-  for (const page of report.pages) {
-    map.set(page.url, page.scores);
-  }
-  return map;
-}
-
-function deltaScores(from: LighthouseScores | null, to: LighthouseScores | null): LighthouseScores {
-  const keys: Array<keyof LighthouseScores> = ["performance", "accessibility", "bestPractices", "seo", "pwa"];
-  const deltas: LighthouseScores = {
-    performance: null,
-    accessibility: null,
-    bestPractices: null,
-    seo: null,
-    pwa: null
-  };
-  for (const key of keys) {
-    const before = from?.[key] ?? null;
-    const after = to?.[key] ?? null;
-    deltas[key] = before !== null && after !== null ? after - before : null;
-  }
-  return deltas;
 }
 
 export function parseCompareArgs(argv: string[]): { from?: string; to?: string } {

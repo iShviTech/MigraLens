@@ -1,5 +1,9 @@
 import type { CoreWebVitals, LighthousePageReport, LighthouseScores, PerfProvider } from "../types.js";
-import { extractLighthouseEngineVersion, resolvePerfProvider } from "../perf/extract.js";
+import {
+  extractCoreWebVitals,
+  extractLighthouseEngineVersion,
+  resolvePerfProvider
+} from "../perf/extract.js";
 
 export function resolveReportProvider(
   report: { provider?: PerfProvider | string | null; pages?: LighthousePageReport[] } | null | undefined
@@ -119,17 +123,33 @@ export function formatDelta(value: number | null | undefined, suffix = ""): stri
   return `${signed}${suffix}`;
 }
 
-export function averageVitals(pages: LighthousePageReport[]): CoreWebVitals {
-  const keys: Array<keyof CoreWebVitals> = ["lcpMs", "cls", "inpMs", "tbtMs", "fcpMs", "siMs", "ttiMs"];
-  const result: CoreWebVitals = {
+export function emptyVitals(): CoreWebVitals {
+  return {
     lcpMs: null,
     cls: null,
     inpMs: null,
     tbtMs: null,
     fcpMs: null,
     siMs: null,
-    ttiMs: null
+    ttiMs: null,
+    loadMs: null,
+    ttfbMs: null
   };
+}
+
+export function averageVitals(pages: LighthousePageReport[]): CoreWebVitals {
+  const keys: Array<keyof CoreWebVitals> = [
+    "lcpMs",
+    "cls",
+    "inpMs",
+    "tbtMs",
+    "fcpMs",
+    "siMs",
+    "ttiMs",
+    "loadMs",
+    "ttfbMs"
+  ];
+  const result = emptyVitals();
   for (const key of keys) {
     const values = pages
       .map((page) => hydrateVitals(page)[key])
@@ -143,30 +163,58 @@ export function averageVitals(pages: LighthousePageReport[]): CoreWebVitals {
   return result;
 }
 
-/** Backfill CWV from lighthouse-mcp `raw.metrics` when normalized fields are null. */
+/** Backfill CWV from lighthouse-mcp `raw.metrics` or full LHR when normalized fields are null/partial. */
 export function hydrateVitals(page: LighthousePageReport): CoreWebVitals {
-  const current = page.coreWebVitals;
-  if (hasAnyVital(current)) {
+  const current = normalizeVitals(page.coreWebVitals);
+  if (hasLoadAndTtfb(current) && hasAnyVital(current)) {
     return current;
+  }
+  const fromPayload = extractCoreWebVitals(page.raw);
+  const merged = mergeVitals(current, fromPayload);
+  if (hasLoadAndTtfb(merged) && hasAnyVital(merged)) {
+    return merged;
   }
   const raw = page.raw as Record<string, unknown> | null | undefined;
   const metrics = (raw?.metrics ?? undefined) as Record<string, unknown> | undefined;
   if (!metrics) {
-    return current;
+    return merged;
   }
-  return {
+  return mergeVitals(merged, {
     lcpMs: metricValue(metrics, "largest-contentful-paint"),
     cls: metricValue(metrics, "cumulative-layout-shift"),
     inpMs: metricValue(metrics, "interaction-to-next-paint"),
     tbtMs: metricValue(metrics, "total-blocking-time"),
     fcpMs: metricValue(metrics, "first-contentful-paint"),
     siMs: metricValue(metrics, "speed-index"),
-    ttiMs: metricValue(metrics, "interactive")
+    ttiMs: metricValue(metrics, "interactive"),
+    loadMs: null,
+    ttfbMs: null
+  });
+}
+
+function normalizeVitals(vitals: CoreWebVitals | null | undefined): CoreWebVitals {
+  return {
+    ...emptyVitals(),
+    ...(vitals ?? {})
   };
+}
+
+function mergeVitals(base: CoreWebVitals, fill: CoreWebVitals): CoreWebVitals {
+  const result = { ...base };
+  for (const key of Object.keys(emptyVitals()) as Array<keyof CoreWebVitals>) {
+    if (result[key] == null && fill[key] != null) {
+      result[key] = fill[key];
+    }
+  }
+  return result;
 }
 
 function hasAnyVital(vitals: CoreWebVitals): boolean {
   return Object.values(vitals).some((value) => typeof value === "number");
+}
+
+function hasLoadAndTtfb(vitals: CoreWebVitals): boolean {
+  return typeof vitals.loadMs === "number" && typeof vitals.ttfbMs === "number";
 }
 
 function metricValue(metrics: Record<string, unknown>, key: string): number | null {

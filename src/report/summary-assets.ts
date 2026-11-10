@@ -140,6 +140,8 @@ export const SUMMARY_SCRIPT = String.raw`
   const SEVERITIES = ["critical", "serious", "moderate", "minor"];
   const SCORE_KEYS = [["performance", "Performance"], ["accessibility", "Accessibility"], ["bestPractices", "Best Practices"], ["seo", "SEO"]];
   const VITALS = [
+    ["loadMs", "Load", "Full page load (observed window load)", 3000, 6000, "ms"],
+    ["ttfbMs", "TTFB", "Time to First Byte", 800, 1800, "ms"],
     ["lcpMs", "LCP", "Largest Contentful Paint", 2500, 4000, "ms"],
     ["fcpMs", "FCP", "First Contentful Paint", 1800, 3000, "ms"],
     ["tbtMs", "TBT", "Total Blocking Time", 200, 600, "ms"],

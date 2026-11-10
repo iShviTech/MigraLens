@@ -29,6 +29,11 @@ export function extractCoreWebVitals(payload: unknown): CoreWebVitals {
   const metrics = findObject(payload, ["metrics"]);
   const audits = findObject(payload, ["audits"]);
   const source = hasNumericMetrics(metrics) ? metrics : audits;
+  const observed = metricsItem(payload, audits);
+  const ttfbFromMetrics =
+    typeof observed?.timeToFirstByte === "number" ? observed.timeToFirstByte : null;
+  const loadFromMetrics =
+    typeof observed?.observedLoad === "number" ? observed.observedLoad : null;
   return {
     lcpMs: numericAudit(source, ["largest-contentful-paint", "lcp"]),
     cls: numericAudit(source, ["cumulative-layout-shift", "cls"]),
@@ -36,8 +41,41 @@ export function extractCoreWebVitals(payload: unknown): CoreWebVitals {
     tbtMs: numericAudit(source, ["total-blocking-time", "tbt"]),
     fcpMs: numericAudit(source, ["first-contentful-paint", "fcp"]),
     siMs: numericAudit(source, ["speed-index", "si"]),
-    ttiMs: numericAudit(source, ["interactive", "tti", "time-to-interactive"])
+    ttiMs: numericAudit(source, ["interactive", "tti", "time-to-interactive"]),
+    loadMs: loadFromMetrics,
+    ttfbMs: ttfbFromMetrics ?? numericAudit(audits ?? source, ["server-response-time", "ttfb"])
   };
+}
+
+/** First `audits.metrics.details.items[0]` blob (PSI-wrapped or raw LHR). */
+function metricsItem(
+  payload: unknown,
+  audits: Record<string, unknown> | undefined
+): Record<string, number> | null {
+  const fromAudits = metricsItemFromAudits(audits);
+  if (fromAudits) {
+    return fromAudits;
+  }
+  const lhr = unwrapLhr(payload);
+  return metricsItemFromAudits(lhr?.audits as Record<string, unknown> | undefined);
+}
+
+function metricsItemFromAudits(
+  audits: Record<string, unknown> | undefined
+): Record<string, number> | null {
+  if (!audits) {
+    return null;
+  }
+  const metricsAudit = audits.metrics;
+  if (!metricsAudit || typeof metricsAudit !== "object") {
+    return null;
+  }
+  const details = (metricsAudit as { details?: { items?: unknown[] } }).details;
+  const item = details?.items?.[0];
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  return item as Record<string, number>;
 }
 
 export function extractLighthouseEngineVersion(payload: unknown): string | null {

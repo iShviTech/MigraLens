@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { violationFingerprint } from "../a11y/axe.js";
 import type { AppConfig } from "../config/env.js";
@@ -23,6 +23,13 @@ import {
   resolveOutputRoot,
   type RunContext
 } from "../utils/run-context.js";
+import { listAllRuns, selectHistoryRuns } from "../compare/history.js";
+import {
+  attachHistoricalSheetGroups,
+  buildPerformanceByDevice,
+  loadLighthouseByDeviceForCompare,
+  primaryDevicePerformance
+} from "../compare/perf-delta.js";
 import { renderComparisonReportHtml } from "./comparison.js";
 import { resolveReportProvider } from "./shared.js";
 import { DEVICES, buildSummaryPayload, renderSummaryReportHtml, type SummaryPayload } from "./summary.js";
@@ -162,13 +169,9 @@ async function writeComparisonArtifacts(
   );
   await ensureDir(outDir);
 
-  const fromPerf = await readJsonIfExists<LighthouseConsolidatedReport>(
-    path.join(comparison.from.runDir, "lighthouse", "consolidated.json")
-  );
-  const toPerf = await readJsonIfExists<LighthouseConsolidatedReport>(
-    path.join(comparison.to.runDir, "lighthouse", "consolidated.json")
-  );
-  const html = renderComparisonReportHtml({ comparison, fromPerf, toPerf });
+  const fromByDevice = await loadLighthouseByDeviceForCompare(comparison.from.runDir);
+  const toByDevice = await loadLighthouseByDeviceForCompare(comparison.to.runDir);
+  const html = renderComparisonReportHtml({ comparison, fromByDevice, toByDevice });
 
   const comparisonPath = path.join(outDir, "comparison-report.html");
   await writeFile(comparisonPath, html, "utf8");
@@ -231,20 +234,24 @@ async function buildExactComparison(
     }
   }
 
-  const fromPerf = await readJsonIfExists<LighthouseConsolidatedReport>(
-    path.join(fromRunDir, "lighthouse", "consolidated.json")
-  );
-  const toPerf = await readJsonIfExists<LighthouseConsolidatedReport>(
-    path.join(toRunDir, "lighthouse", "consolidated.json")
-  );
-  const fromScores = new Map((fromPerf?.pages ?? []).map((page) => [page.url, page.scores]));
-  const toScores = new Map((toPerf?.pages ?? []).map((page) => [page.url, page.scores]));
-  const scoreUrls = new Set([...fromScores.keys(), ...toScores.keys()]);
+  const fromByDevice = await loadLighthouseByDeviceForCompare(fromRunDir);
+  const toByDevice = await loadLighthouseByDeviceForCompare(toRunDir);
+  const endpointBlocks = buildPerformanceByDevice(fromByDevice, toByDevice, fromDate, toDate);
+  // run-all: accumulate every dated audit through the current day (not only previous→current).
+  const historyRuns = await selectHistoryRuns(resolveOutputRoot(config), undefined, toDate);
+  const performanceByDevice = await attachHistoricalSheetGroups(endpointBlocks, historyRuns, toUrls);
+  const fromPrimary =
+    fromByDevice[config.LIGHTHOUSE_DEVICE] ??
+    fromByDevice.desktop ??
+    fromByDevice.mobile ??
+    null;
+  const toPrimary =
+    toByDevice[config.LIGHTHOUSE_DEVICE] ?? toByDevice.desktop ?? toByDevice.mobile ?? null;
 
   return {
     generatedAt: new Date().toISOString(),
-    from: { date: fromDate, runDir: fromRunDir, provider: resolveReportProvider(fromPerf) },
-    to: { date: toDate, runDir: toRunDir, provider: resolveReportProvider(toPerf) },
+    from: { date: fromDate, runDir: fromRunDir, provider: resolveReportProvider(fromPrimary) },
+    to: { date: toDate, runDir: toRunDir, provider: resolveReportProvider(toPrimary) },
     urls: {
       added: toUrls.filter((url) => !fromSet.has(url)),
       removed: fromUrls.filter((url) => !toSet.has(url)),
@@ -255,27 +262,9 @@ async function buildExactComparison(
       fixedViolations: [...fromMap.entries()].filter(([fp]) => !toMap.has(fp)).map(([, value]) => value),
       unchangedCount: [...toMap.keys()].filter((fp) => fromMap.has(fp)).length
     },
-    performance: [...scoreUrls].sort().map((url) => {
-      const before = fromScores.get(url) ?? null;
-      const after = toScores.get(url) ?? null;
-      return {
-        url,
-        fromScores: before,
-        toScores: after,
-        deltas: {
-          performance: numericDelta(before?.performance ?? null, after?.performance ?? null),
-          accessibility: numericDelta(before?.accessibility ?? null, after?.accessibility ?? null),
-          bestPractices: numericDelta(before?.bestPractices ?? null, after?.bestPractices ?? null),
-          seo: numericDelta(before?.seo ?? null, after?.seo ?? null),
-          pwa: numericDelta(before?.pwa ?? null, after?.pwa ?? null)
-        }
-      };
-    })
+    performance: primaryDevicePerformance(performanceByDevice, config.LIGHTHOUSE_DEVICE),
+    performanceByDevice
   };
-}
-
-function numericDelta(from: number | null, to: number | null): number | null {
-  return from !== null && to !== null ? to - from : null;
 }
 
 export async function findPreviousRun(config: AppConfig, current: RunContext): Promise<string | null> {
@@ -283,28 +272,6 @@ export async function findPreviousRun(config: AppConfig, current: RunContext): P
   const currentKey = `${current.date}/${current.timestamp}`;
   const earlier = runs.filter((run) => run.key < currentKey);
   return earlier.at(-1)?.runDir ?? null;
-}
-
-async function listAllRuns(root: string): Promise<Array<{ key: string; runDir: string }>> {
-  if (!existsSync(root)) {
-    return [];
-  }
-  const dates = (await readdir(root, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory() && /^\d{4}-\d{2}-\d{2}$/.test(entry.name))
-    .map((entry) => entry.name)
-    .sort();
-  const runs: Array<{ key: string; runDir: string }> = [];
-  for (const date of dates) {
-    const dateDir = path.join(root, date);
-    const stamps = (await readdir(dateDir, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && /^\d{6}$/.test(entry.name))
-      .map((entry) => entry.name)
-      .sort();
-    for (const timestamp of stamps) {
-      runs.push({ key: `${date}/${timestamp}`, runDir: path.join(dateDir, timestamp) });
-    }
-  }
-  return runs;
 }
 
 function splitRunDir(root: string, runDir: string): { date: string; timestamp: string } | null {
