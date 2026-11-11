@@ -15,7 +15,7 @@ import {
 
 function buildSummaryMd(result: Awaited<ReturnType<typeof runNavigatePageWarmup>>, runDir: string): string {
   const lines: string[] = [
-    "# navigatePage report",
+    "# navigate-page report",
     "",
     `- Run dir: \`${runDir}\``,
     `- Started: ${result.startedAt}`,

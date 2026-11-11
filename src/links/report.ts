@@ -1,15 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ensureDir, writeJson } from "../utils/fs.js";
+import { escapeHtml } from "../utils/html.js";
 import type { CheckLinksResult, UniqueLinkRecord } from "./check-links.js";
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 function escapeMd(value: string): string {
   return value.replace(/\|/g, "\\|");

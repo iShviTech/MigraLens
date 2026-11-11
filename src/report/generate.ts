@@ -1,18 +1,15 @@
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { violationFingerprint } from "../a11y/axe.js";
 import type { AppConfig } from "../config/env.js";
 import type {
   AccessibilityConsolidatedReport,
   ComparisonReport,
   CrawlMeta,
   FlatUrlInventory,
-  LighthouseConsolidatedReport,
-  LighthouseDevice,
   LatestRunPointer
 } from "../types.js";
-import { ensureDir, urlToFilename, writeJson } from "../utils/fs.js";
+import { ensureDir, readJsonIfExists, writeJson } from "../utils/fs.js";
 import { logInfo, logWarn } from "../utils/logger.js";
 import {
   hydrateRunContext,
@@ -23,16 +20,11 @@ import {
   resolveOutputRoot,
   type RunContext
 } from "../utils/run-context.js";
-import { listAllRuns, selectHistoryRuns } from "../compare/history.js";
-import {
-  attachHistoricalSheetGroups,
-  buildPerformanceByDevice,
-  loadLighthouseByDeviceForCompare,
-  primaryDevicePerformance
-} from "../compare/perf-delta.js";
+import { buildComparisonReport } from "../compare/engine.js";
+import { listAllRuns } from "../compare/history.js";
+import { loadLighthouseByDevice, loadLighthouseByDeviceForCompare } from "../compare/perf-delta.js";
 import { renderComparisonReportHtml } from "./comparison.js";
-import { resolveReportProvider } from "./shared.js";
-import { DEVICES, buildSummaryPayload, renderSummaryReportHtml, type SummaryPayload } from "./summary.js";
+import { buildSummaryPayload, renderSummaryReportHtml, type SummaryPayload } from "./summary.js";
 
 export async function writeRunHtmlReports(
   config: AppConfig,
@@ -53,8 +45,8 @@ export async function writeRunHtmlReports(
   const previousRunDir = await findPreviousRun(config, ctx);
   const previous = previousRunDir ? splitRunDir(resolveOutputRoot(config), previousRunDir) : null;
   const comparison = previousRunDir && previous
-    ? await buildExactComparison(config, previousRunDir, ctx.runDir, previous.date, ctx.date)
-    : await buildExactComparison(config, ctx.runDir, ctx.runDir, ctx.date, ctx.date);
+    ? await buildComparisonReport(config, previousRunDir, ctx.runDir, previous.date, ctx.date)
+    : await buildComparisonReport(config, ctx.runDir, ctx.runDir, ctx.date, ctx.date);
 
   if (!previousRunDir) {
     logInfo("No previous run found — writing baseline comparison-report.html", { runDir: ctx.runDir });
@@ -79,12 +71,12 @@ export async function writeRootSummaryReport(config: AppConfig, ctx: RunContext)
 }
 
 async function loadSummaryPayload(config: AppConfig, ctx: RunContext): Promise<SummaryPayload | null> {
-  const inventory = await readJson<FlatUrlInventory>(resolveInventoryFlatPath(config, ctx.runDir));
+  const inventory = await readJsonIfExists<FlatUrlInventory>(resolveInventoryFlatPath(config, ctx.runDir));
   const crawlMeta = await readJsonIfExists<CrawlMeta>(resolveInventoryMetaPath(config, ctx.runDir));
   const accessibility = await readJsonIfExists<AccessibilityConsolidatedReport>(
     path.join(ctx.accessibilityDir, "consolidated.json")
   );
-  const lighthouseByDevice = await loadLighthouseByDevice(ctx.runDir);
+  const lighthouseByDevice = await loadLighthouseByDevice(ctx.runDir, { backfillFiles: true });
   if (!accessibility && Object.keys(lighthouseByDevice).length === 0) {
     return null;
   }
@@ -107,46 +99,6 @@ async function loadSummaryPayload(config: AppConfig, ctx: RunContext): Promise<S
     accessibility,
     lighthouseByDevice
   });
-}
-
-/**
- * Per-device consolidated reports (`lighthouse/{device}/consolidated.json`). Runs from before
- * multi-device audits only have `lighthouse/consolidated.json`; it is filed under its own device.
- */
-export async function loadLighthouseByDevice(
-  runDir: string
-): Promise<Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>>> {
-  const result: Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>> = {};
-  for (const device of DEVICES) {
-    const report = await readJsonIfExists<LighthouseConsolidatedReport>(
-      path.join(runDir, "lighthouse", device, "consolidated.json")
-    );
-    if (report) {
-      result[device] = report;
-    }
-  }
-  if (Object.keys(result).length > 0) {
-    return result;
-  }
-  const legacy = await readJsonIfExists<LighthouseConsolidatedReport>(path.join(runDir, "lighthouse", "consolidated.json"));
-  if (!legacy) {
-    return result;
-  }
-  const device: LighthouseDevice = legacy.device ?? (legacy.pages[0]?.device === "mobile" ? "mobile" : "desktop");
-  for (const page of legacy.pages) {
-    if (page.files) {
-      continue;
-    }
-    const stem = urlToFilename(page.url);
-    const html = `lighthouse/by-url/${stem}.html`;
-    const json = `lighthouse/by-url/${stem}.json`;
-    page.files = {
-      html: existsSync(path.join(runDir, html)) ? html : null,
-      json: existsSync(path.join(runDir, json)) ? json : null
-    };
-  }
-  result[device] = legacy;
-  return result;
 }
 
 export async function writeComparisonHtmlReport(
@@ -188,85 +140,6 @@ async function writeComparisonArtifacts(
   return companionRunDir ? path.join(companionRunDir, "comparison-report.html") : comparisonPath;
 }
 
-async function buildExactComparison(
-  config: AppConfig,
-  fromRunDir: string,
-  toRunDir: string,
-  fromDate: string,
-  toDate: string
-): Promise<ComparisonReport> {
-  const fromUrls = (await readJson<FlatUrlInventory>(resolveInventoryFlatPath(config, fromRunDir)))?.urls ?? [];
-  const toUrls = (await readJson<FlatUrlInventory>(resolveInventoryFlatPath(config, toRunDir)))?.urls ?? [];
-  const fromSet = new Set(fromUrls);
-  const toSet = new Set(toUrls);
-
-  const fromA11y = await readJsonIfExists<AccessibilityConsolidatedReport>(
-    path.join(fromRunDir, "accessibility", "consolidated.json")
-  );
-  const toA11y = await readJsonIfExists<AccessibilityConsolidatedReport>(
-    path.join(toRunDir, "accessibility", "consolidated.json")
-  );
-
-  const fromMap = new Map<string, ComparisonReport["accessibility"]["addedViolations"][number]>();
-  const toMap = new Map<string, ComparisonReport["accessibility"]["addedViolations"][number]>();
-  for (const page of fromA11y?.pages ?? []) {
-    for (const violation of page.violations) {
-      const fingerprint = violationFingerprint(page.url, violation);
-      fromMap.set(fingerprint, {
-        url: page.url,
-        fingerprint,
-        id: violation.id,
-        impact: violation.impact,
-        help: violation.help
-      });
-    }
-  }
-  for (const page of toA11y?.pages ?? []) {
-    for (const violation of page.violations) {
-      const fingerprint = violationFingerprint(page.url, violation);
-      toMap.set(fingerprint, {
-        url: page.url,
-        fingerprint,
-        id: violation.id,
-        impact: violation.impact,
-        help: violation.help
-      });
-    }
-  }
-
-  const fromByDevice = await loadLighthouseByDeviceForCompare(fromRunDir);
-  const toByDevice = await loadLighthouseByDeviceForCompare(toRunDir);
-  const endpointBlocks = buildPerformanceByDevice(fromByDevice, toByDevice, fromDate, toDate);
-  // run-all: accumulate every dated audit through the current day (not only previous→current).
-  const historyRuns = await selectHistoryRuns(resolveOutputRoot(config), undefined, toDate);
-  const performanceByDevice = await attachHistoricalSheetGroups(endpointBlocks, historyRuns, toUrls);
-  const fromPrimary =
-    fromByDevice[config.LIGHTHOUSE_DEVICE] ??
-    fromByDevice.desktop ??
-    fromByDevice.mobile ??
-    null;
-  const toPrimary =
-    toByDevice[config.LIGHTHOUSE_DEVICE] ?? toByDevice.desktop ?? toByDevice.mobile ?? null;
-
-  return {
-    generatedAt: new Date().toISOString(),
-    from: { date: fromDate, runDir: fromRunDir, provider: resolveReportProvider(fromPrimary) },
-    to: { date: toDate, runDir: toRunDir, provider: resolveReportProvider(toPrimary) },
-    urls: {
-      added: toUrls.filter((url) => !fromSet.has(url)),
-      removed: fromUrls.filter((url) => !toSet.has(url)),
-      shared: toUrls.filter((url) => fromSet.has(url))
-    },
-    accessibility: {
-      addedViolations: [...toMap.entries()].filter(([fp]) => !fromMap.has(fp)).map(([, value]) => value),
-      fixedViolations: [...fromMap.entries()].filter(([fp]) => !toMap.has(fp)).map(([, value]) => value),
-      unchangedCount: [...toMap.keys()].filter((fp) => fromMap.has(fp)).length
-    },
-    performance: primaryDevicePerformance(performanceByDevice, config.LIGHTHOUSE_DEVICE),
-    performanceByDevice
-  };
-}
-
 export async function findPreviousRun(config: AppConfig, current: RunContext): Promise<string | null> {
   const runs = await listAllRuns(resolveOutputRoot(config));
   const currentKey = `${current.date}/${current.timestamp}`;
@@ -281,17 +154,6 @@ function splitRunDir(root: string, runDir: string): { date: string; timestamp: s
     return null;
   }
   return { date, timestamp };
-}
-
-async function readJson<T>(filePath: string): Promise<T | null> {
-  if (!existsSync(filePath)) {
-    return null;
-  }
-  return JSON.parse(await readFile(filePath, "utf8")) as T;
-}
-
-async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
-  return readJson<T>(filePath);
 }
 
 export async function resolveRunForReport(config: AppConfig, runId?: string): Promise<RunContext> {

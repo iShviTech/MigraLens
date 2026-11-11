@@ -1,5 +1,5 @@
 import type { LighthouseDevice } from "../types.js";
-import { REPORT_CSS, escapeHtml } from "../report/shared.js";
+import { REPORT_CSS, capitalize, escapeHtml } from "../report/shared.js";
 import type { DashboardPayload, DomainDashboardData } from "./build.js";
 
 export function renderDashboardIndex(payload: DashboardPayload): string {
@@ -229,6 +229,3 @@ table.sheet-table td.error { color:#c62828; font-weight:600; text-align:center; 
 </html>`;
 }
 
-function capitalize(value: string): string {
-  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
-}

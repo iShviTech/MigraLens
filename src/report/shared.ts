@@ -1,9 +1,31 @@
-import type { CoreWebVitals, LighthousePageReport, LighthouseScores, PerfProvider } from "../types.js";
+import type {
+  CoreWebVitals,
+  LighthouseDevice,
+  LighthousePageReport,
+  LighthouseScores,
+  PerfProvider
+} from "../types.js";
 import {
   extractCoreWebVitals,
   extractLighthouseEngineVersion,
   resolvePerfProvider
 } from "../perf/extract.js";
+export { capitalize, escapeHtml } from "../utils/html.js";
+
+/** Device columns used by summary/compare/dashboard report layout. */
+export const REPORT_DEVICES: LighthouseDevice[] = ["mobile", "desktop"];
+
+const VITAL_KEYS: Array<keyof CoreWebVitals> = [
+  "lcpMs",
+  "cls",
+  "inpMs",
+  "tbtMs",
+  "fcpMs",
+  "siMs",
+  "ttiMs",
+  "loadMs",
+  "ttfbMs"
+];
 
 export function resolveReportProvider(
   report: { provider?: PerfProvider | string | null; pages?: LighthousePageReport[] } | null | undefined
@@ -17,49 +39,6 @@ export function resolveReportProvider(
 
 export function providerLabel(provider: PerfProvider): string {
   return provider === "pagespeed" ? "PageSpeed Insights" : "Lighthouse";
-}
-
-export function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-export function scoreBand(score: number | null | undefined): "green" | "orange" | "red" | "muted" {
-  if (score === null || score === undefined || Number.isNaN(score)) {
-    return "muted";
-  }
-  if (score >= 90) {
-    return "green";
-  }
-  if (score >= 50) {
-    return "orange";
-  }
-  return "red";
-}
-
-export function scoreBadgeClass(score: number | null | undefined): string {
-  return `badge badge-${scoreBand(score)}`;
-}
-
-export function impactBadgeClass(impact: string | null | undefined): string {
-  const key = (impact ?? "unknown").toLowerCase();
-  if (key === "critical") {
-    return "badge badge-red";
-  }
-  if (key === "serious") {
-    return "badge badge-orange";
-  }
-  if (key === "moderate") {
-    return "badge badge-amber";
-  }
-  if (key === "minor") {
-    return "badge badge-blue";
-  }
-  return "badge badge-muted";
 }
 
 export function wcagVerdict(
@@ -114,15 +93,6 @@ export function formatCls(value: number | null | undefined): string {
   return value.toFixed(3);
 }
 
-export function formatDelta(value: number | null | undefined, suffix = ""): string {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
-  }
-  const rounded = Number.isInteger(value) ? String(value) : value.toFixed(3);
-  const signed = value > 0 ? `+${rounded}` : rounded;
-  return `${signed}${suffix}`;
-}
-
 export function emptyVitals(): CoreWebVitals {
   return {
     lcpMs: null,
@@ -138,19 +108,8 @@ export function emptyVitals(): CoreWebVitals {
 }
 
 export function averageVitals(pages: LighthousePageReport[]): CoreWebVitals {
-  const keys: Array<keyof CoreWebVitals> = [
-    "lcpMs",
-    "cls",
-    "inpMs",
-    "tbtMs",
-    "fcpMs",
-    "siMs",
-    "ttiMs",
-    "loadMs",
-    "ttfbMs"
-  ];
   const result = emptyVitals();
-  for (const key of keys) {
+  for (const key of VITAL_KEYS) {
     const values = pages
       .map((page) => hydrateVitals(page)[key])
       .filter((value): value is number => typeof value === "number");
@@ -199,9 +158,9 @@ function normalizeVitals(vitals: CoreWebVitals | null | undefined): CoreWebVital
   };
 }
 
-function mergeVitals(base: CoreWebVitals, fill: CoreWebVitals): CoreWebVitals {
+export function mergeVitals(base: CoreWebVitals, fill: CoreWebVitals): CoreWebVitals {
   const result = { ...base };
-  for (const key of Object.keys(emptyVitals()) as Array<keyof CoreWebVitals>) {
+  for (const key of VITAL_KEYS) {
     if (result[key] == null && fill[key] != null) {
       result[key] = fill[key];
     }

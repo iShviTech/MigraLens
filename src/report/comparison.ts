@@ -7,7 +7,7 @@ import type {
   LighthouseScores
 } from "../types.js";
 import { buildSheetGroups } from "../compare/perf-delta.js";
-import { REPORT_CSS, escapeHtml, providerLabel, resolveReportProvider } from "./shared.js";
+import { REPORT_CSS, capitalize, escapeHtml, providerLabel, resolveReportProvider } from "./shared.js";
 
 export interface ComparisonHtmlInput {
   comparison: ComparisonReport;
@@ -382,6 +382,3 @@ function synthesizeBlocks(
   }));
 }
 
-function capitalize(value: string): string {
-  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
-}

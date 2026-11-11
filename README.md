@@ -4,7 +4,7 @@ Playwright crawler + axe-core accessibility and Lighthouse / PageSpeed Insights 
 
 ## What it does
 
-1. **Scrape internal** (`npm run scrape-internal`, alias `npm run scrape`) — discover **internal** page URLs from `TARGET_URL`. Writes `{OUTPUT_DIR}/url/urls-flat.json`.
+1. **Scrape internal** (`npm run scrape`) — discover **internal** page URLs from `TARGET_URL`. Writes `{OUTPUT_DIR}/url/urls-flat.json`.
 2. **Scrape all extras** (`npm run scrape-all`) — open pages from `urls-flat.json`, harvest external links, images, and other resources **not** already in the flat file → `{OUTPUT_DIR}/url/urls-with-external.json`.
 3. **Audit** — for each new run, create a **new** dated folder, read URLs from the shared inventory, then run axe-core + performance (Lighthouse MCP or PageSpeed Insights) and generate HTML reports.
 4. **Compare** — trend scores and accessibility changes across previous dated runs.
@@ -16,11 +16,11 @@ Artifacts are written as:
 
 ```text
 {OUTPUT_DIR}/url/                  # shared URL inventories
-  urls-flat.json                   # scrape-internal (internal pages)
+  urls-flat.json                   # scrape (internal pages)
   urls-with-external.json          # scrape-all (external / image / asset / document / other)
   urls-category.json
   crawl-meta.json
-{OUTPUT_DIR}/navigatePage/{YYYY-MM-DD}/{HHmmss}/  # npm run navigatePage report
+{OUTPUT_DIR}/navigatePage/{YYYY-MM-DD}/{HHmmss}/  # npm run navigate-page report
   manifest.json
   opened-urls.json
   summary.md
@@ -100,9 +100,9 @@ Edit `.env` before the first run. Required keys:
 | `LIGHTHOUSE_DEVICES` | Devices audited per URL (default `mobile,desktop`) |
 | `LIGHTHOUSE_DEVICE` | Primary device: default summary view and the copy in `lighthouse/consolidated.json` (default `desktop`) |
 | `CONCURRENCY_LIMIT` | Parallel audit workers |
-| `NAVIGATE_PAGE_CONCURRENCY` | Parallel visible Chrome windows for `npm run navigatePage` (default `1`) |
+| `NAVIGATE_PAGE_CONCURRENCY` | Parallel visible Chrome windows for `npm run navigate-page` (default `1`) |
 | `NAVIGATE_PAGE_DWELL_MS` | Dwell after full page load before next URL (default `30000`) |
-| `NAVIGATE_PAGE_NAV_TIMEOUT_MS` | Navigation timeout per navigatePage URL (default `60000`) |
+| `NAVIGATE_PAGE_NAV_TIMEOUT_MS` | Navigation timeout per navigate-page URL (default `60000`) |
 | `LIVE_URL` | Public production origin (content-compare + preferred origin for `check-links`). No login |
 | `LINK_CHECK_PATHS` | Optional comma-separated paths for `check-links`; empty uses `urls-flat.json` remapped onto live |
 | `LINK_CHECK_CONCURRENCY` | Parallel HTTP probes for unique link targets (default `8`) |
@@ -129,13 +129,13 @@ Accessibility uses free open-source **axe-core** via Playwright. Local Lighthous
 ## Broken-link check (live + external)
 
 ```bash
-npm run scrape-internal   # or: npm run scrape  → urls-flat.json
+npm run scrape            # → urls-flat.json
 npm run scrape-all        # → urls-with-external.json (requires flat inventory)
 npm run check-links       # probes both files
 ```
 
 1. Set `LIVE_URL` (preferred) or rely on `TARGET_URL` in `.env`. Live is public — no credentials.
-2. `scrape-internal` crawls **internal pages only** into `reports/url/urls-flat.json`.
+2. `npm run scrape` crawls **internal pages only** into `reports/url/urls-flat.json`.
 3. `scrape-all` opens those pages and writes external links, images, CSS/JS, documents, iframes, etc. that are **not** already in the flat file → `reports/url/urls-with-external.json`.
 4. `check-links` loads **both** inventories and probes every unique URL (no re-harvest). Optional `LINK_CHECK_PATHS` limits which internal paths (and external entries sourced from those pages) are probed.
 5. Open `reports/broken-links/{YYYY-MM-DD}/{HHmmss}/summary.html` (also `summary.md`, `links.json`).
@@ -171,9 +171,9 @@ How the checks work (WordPress → Drupal, so layout and markup are expected to 
 
 ```bash
 npm run init-env                     # create .env from .env.example (-- --force to overwrite)
-npm run scrape-internal              # internal pages → urls-flat.json (alias: npm run scrape)
+npm run scrape                       # internal pages → urls-flat.json
 npm run scrape-all                   # external/image/other → urls-with-external.json
-npm run navigatePage                 # open every urls-flat.json URL in real Chrome (unique queue)
+npm run navigate-page                # open every urls-flat.json URL in real Chrome (unique queue)
 npm run check-links                  # probe both inventories; broken-links HTML report
 npm run run-all                      # NEW folder → a11y + perf + HTML reports
 npm run audit:a11y                   # NEW folder → accessibility only (+ reports)
@@ -185,13 +185,13 @@ npm run compare -- --from 2026-03-01 --to 2026-03-15
 npm run content-compare               # live vs stage content, images, SEO, links
 ```
 
-`npm run navigatePage` launches **visible Google Chrome** (`channel: chrome`, never headless), visits every URL from `reports/url/urls-flat.json`, waits for full load, then dwells (`NAVIGATE_PAGE_DWELL_MS`, default 30s) before the next URL. Parallel windows (`NAVIGATE_PAGE_CONCURRENCY`, default 1) share one unique FIFO queue so no URL is opened twice. Report: `reports/navigatePage/{YYYY-MM-DD}/{HHmmss}/` (`manifest.json`, `opened-urls.json`, `summary.md`).
+`npm run navigate-page` launches **visible Google Chrome** (`channel: chrome`, never headless), visits every URL from `reports/url/urls-flat.json`, waits for full load, then dwells (`NAVIGATE_PAGE_DWELL_MS`, default 30s) before the next URL. Parallel windows (`NAVIGATE_PAGE_CONCURRENCY`, default 1) share one unique FIFO queue so no URL is opened twice. Report: `reports/navigatePage/{YYYY-MM-DD}/{HHmmss}/` (`manifest.json`, `opened-urls.json`, `summary.md`).
 
 `npm run check-links` probes URLs from `urls-flat.json` and `urls-with-external.json` against the public live origin (`LIVE_URL` or `TARGET_URL`) and writes `reports/broken-links/{YYYY-MM-DD}/{HHmmss}/`.
 
 ### Recommended workflow
 
-1. **Once** (or after sitemap / IA changes): `npm run scrape-internal` → `urls-flat.json`; then `npm run scrape-all` → `urls-with-external.json`.
+1. **Once** (or after sitemap / IA changes): `npm run scrape` → `urls-flat.json`; then `npm run scrape-all` → `urls-with-external.json`.
 2. **Every audit**: `npm run run-all` — always creates `reports/YYYY-MM-DD/HHmmss/` and reads URLs from `reports/url/urls-flat.json`; never overwrites a previous audit folder.
 3. **Dead-link QA on live**: `npm run check-links` after both scrapes (optionally with `LINK_CHECK_PATHS` for a smoke set).
 

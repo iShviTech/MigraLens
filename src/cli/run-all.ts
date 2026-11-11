@@ -1,17 +1,11 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { runAccessibilityAudit } from "../audit/accessibility.js";
 import { runPerformanceAudit } from "../audit/performance.js";
 import { loadConfig } from "../config/env.js";
 import { writeDashboard } from "../dashboard/write.js";
 import { writeRootSummaryReport, writeRunHtmlReports } from "../report/generate.js";
+import { writeRootComparisonReport } from "../report/root-comparison.js";
 import { logInfo } from "../utils/logger.js";
 import { createAuditRunFromScrape } from "../utils/run-context.js";
-
-const execFileAsync = promisify(execFile);
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 /**
  * Audit pipeline (no scrape):
@@ -32,24 +26,17 @@ async function main(): Promise<void> {
 
   const reports = await writeRunHtmlReports(config, ctx);
   const rootSummary = await writeRootSummaryReport(config, ctx);
-  await generateRootComparisonReport();
+  const rootComparison = await writeRootComparisonReport(config, {
+    to: `${ctx.date}/${ctx.timestamp}`
+  });
   const dashboard = await writeDashboard(config);
 
   logInfo("Audit pipeline finished", {
     runDir: ctx.runDir,
     ...reports,
     rootSummary,
-    rootComparison: path.join(config.OUTPUT_DIR, "comparison-report.html"),
+    rootComparison,
     dashboardIndex: dashboard.indexPath
-  });
-}
-
-async function generateRootComparisonReport(): Promise<void> {
-  const script = "scripts/generate-comparison-report.js";
-  logInfo("Generating root report", { script });
-  await execFileAsync(process.execPath, [path.join(PROJECT_ROOT, script)], {
-    cwd: PROJECT_ROOT,
-    maxBuffer: 10 * 1024 * 1024
   });
 }
 

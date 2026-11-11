@@ -13,7 +13,9 @@ import type {
   NormalizedViolation
 } from "../types.js";
 import {
+  REPORT_DEVICES,
   averageVitals,
+  capitalize,
   escapeHtml,
   formatCls,
   formatMs,
@@ -25,8 +27,6 @@ import {
   wcagVerdict
 } from "./shared.js";
 import { SUMMARY_CSS, SUMMARY_SCRIPT } from "./summary-assets.js";
-
-export const DEVICES: LighthouseDevice[] = ["mobile", "desktop"];
 
 export interface SummaryReportInput {
   targetUrl: string;
@@ -159,7 +159,7 @@ const IMPACT_ORDER = ["critical", "serious", "moderate", "minor", "unknown"];
 const MIN_GLOBAL_PAGES = 3;
 
 export function buildSummaryPayload(input: SummaryReportInput): SummaryPayload {
-  const devices = DEVICES.filter((device) => input.lighthouseByDevice[device]);
+  const devices = REPORT_DEVICES.filter((device) => input.lighthouseByDevice[device]);
   const reports = devices.map((device) => input.lighthouseByDevice[device]!);
   const perfProvider = resolveReportProvider(reports[0]);
   const a11y = input.accessibility;
@@ -339,7 +339,7 @@ function groupIssues(pages: CompactPage[], totalPages: number, globalPct: number
       }
     }
 
-    for (const device of DEVICES) {
+    for (const device of REPORT_DEVICES) {
       for (const audit of page.devices[device]?.a11yAudits?.failed ?? []) {
         const group = ensure(audit.id, {
           title: audit.title,
@@ -573,10 +573,6 @@ export function renderSummaryReportHtml(payload: SummaryPayload, options: { asse
   <script>${SUMMARY_SCRIPT}</script>
 </body>
 </html>`;
-}
-
-function capitalize(value: string): string {
-  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
 }
 
 function axeVersion(pages: AccessibilityPageReport[]): string {

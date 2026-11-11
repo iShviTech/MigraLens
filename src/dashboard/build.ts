@@ -4,6 +4,7 @@ import {
   buildHistoricalSheetGroups,
   loadLighthouseByDeviceForCompare
 } from "../compare/perf-delta.js";
+import { REPORT_DEVICES } from "../report/shared.js";
 import type {
   ComparisonSheetUrlGroup,
   LighthouseConsolidatedReport,
@@ -11,8 +12,6 @@ import type {
 } from "../types.js";
 import { resolveOutputRoot } from "../utils/run-context.js";
 import { loadHistoryExclude } from "./exclude.js";
-
-const DEVICES: LighthouseDevice[] = ["mobile", "desktop"];
 
 export interface DomainDashboardData {
   hostname: string;
@@ -46,7 +45,7 @@ export async function buildDashboardPayload(config: AppConfig): Promise<Dashboar
   const hostnames = collectHostnames(loaded);
   const domains: DomainDashboardData[] = hostnames.map((hostname) => {
     const devices = {} as Record<LighthouseDevice, ComparisonSheetUrlGroup[]>;
-    for (const device of DEVICES) {
+    for (const device of REPORT_DEVICES) {
       const urls = collectUrlsForHost(loaded, device, hostname);
       const groups = buildHistoricalSheetGroups(device, urls, loaded).map((group) => ({
         ...group,
@@ -78,7 +77,7 @@ function collectHostnames(
 ): string[] {
   const hosts = new Set<string>();
   for (const entry of loaded) {
-    for (const device of DEVICES) {
+    for (const device of REPORT_DEVICES) {
       const report = entry.byDevice[device];
       for (const page of report?.pages ?? []) {
         const host = hostnameOf(page.url);

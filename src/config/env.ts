@@ -62,11 +62,11 @@ const envSchema = z.object({
   /** Required when PERF_PROVIDER=pagespeed. Get a key from Google Cloud Console. */
   PAGESPEED_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
   CONCURRENCY_LIMIT: optionalNumber.pipe(z.number().int().min(1).default(2)),
-  /** Parallel visible Chrome windows for `npm run navigatePage` (default 1). */
+  /** Parallel visible Chrome windows for `npm run navigate-page` (default 1). */
   NAVIGATE_PAGE_CONCURRENCY: optionalNumber.pipe(z.number().int().min(1).default(1)),
   /** Dwell time after each page finishes loading (default 30s). */
   NAVIGATE_PAGE_DWELL_MS: optionalNumber.pipe(z.number().int().positive().default(30_000)),
-  /** Navigation timeout per URL for navigatePage. */
+  /** Navigation timeout per URL for navigate-page. */
   NAVIGATE_PAGE_NAV_TIMEOUT_MS: optionalNumber.pipe(z.number().int().positive().default(60_000)),
   INCLUDE_QUERY_PARAMS: booleanFromEnv.pipe(z.boolean().default(false)),
   /** When true, follow off-origin http(s) links (bounded by MAX_CRAWL_DEPTH / MAX_URLS). */

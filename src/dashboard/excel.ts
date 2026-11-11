@@ -1,4 +1,5 @@
 import ExcelJS from "exceljs";
+import { capitalize } from "../report/shared.js";
 import type { ComparisonSheetRun, ComparisonSheetUrlGroup, LighthouseDevice } from "../types.js";
 import type { DomainDashboardData } from "./build.js";
 
@@ -172,6 +173,3 @@ function setMetricCell(
   };
 }
 
-function capitalize(value: string): string {
-  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
-}

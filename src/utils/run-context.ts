@@ -125,7 +125,7 @@ export function assertHasInventory(config: AppConfig): void {
   const { flat } = inventoryPaths(config);
   if (!existsSync(flat)) {
     throw new Error(
-      `Scrape inventory missing urls-flat.json at ${flat}. Run \`npm run scrape-internal\` (or \`npm run scrape\`) once.`
+      `Scrape inventory missing urls-flat.json at ${flat}. Run \`npm run scrape\` once.`
     );
   }
 }
@@ -135,7 +135,7 @@ export function assertHasExternalInventory(config: AppConfig): void {
   const { external } = inventoryPaths(config);
   if (!existsSync(external)) {
     throw new Error(
-      `External inventory missing urls-with-external.json at ${external}. Run \`npm run scrape-all\` after scrape-internal.`
+      `External inventory missing urls-with-external.json at ${external}. Run \`npm run scrape-all\` after \`npm run scrape\`.`
     );
   }
 }

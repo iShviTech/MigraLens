@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config/env.js";
 import { violationFingerprint } from "../a11y/axe.js";
@@ -9,7 +9,8 @@ import type {
   FlatUrlInventory,
   NormalizedViolation
 } from "../types.js";
-import { writeJson } from "../utils/fs.js";
+import { readJsonIfExists, writeJson } from "../utils/fs.js";
+import { capitalize } from "../utils/html.js";
 import { logInfo } from "../utils/logger.js";
 import { resolveInventoryFlatPath, resolveOutputRoot } from "../utils/run-context.js";
 import { resolveReportProvider } from "../report/shared.js";
@@ -21,47 +22,44 @@ import {
   primaryDevicePerformance
 } from "./perf-delta.js";
 
-export async function compareRuns(
-  config: AppConfig,
-  fromDate: string,
-  toDate: string
-): Promise<ComparisonReport> {
-  const fromRun = await latestRunForDate(config, fromDate);
-  const toRun = await latestRunForDate(config, toDate);
+export interface BuildComparisonOptions {
+  /** Inclusive lower bound for history sheets. Omit to accumulate all runs through `toDate`. */
+  historyFromDate?: string;
+}
 
-  const fromUrls = await readUrls(config, fromRun);
-  const toUrls = await readUrls(config, toRun);
+export async function buildComparisonReport(
+  config: AppConfig,
+  fromRunDir: string,
+  toRunDir: string,
+  fromDate: string,
+  toDate: string,
+  options: BuildComparisonOptions = {}
+): Promise<ComparisonReport> {
+  const fromUrls =
+    (await readJsonIfExists<FlatUrlInventory>(resolveInventoryFlatPath(config, fromRunDir)))?.urls ?? [];
+  const toUrls =
+    (await readJsonIfExists<FlatUrlInventory>(resolveInventoryFlatPath(config, toRunDir)))?.urls ?? [];
   const fromSet = new Set(fromUrls);
   const toSet = new Set(toUrls);
 
-  const added = toUrls.filter((url) => !fromSet.has(url));
-  const removed = fromUrls.filter((url) => !toSet.has(url));
-  const shared = toUrls.filter((url) => fromSet.has(url));
-
   const fromA11y = await readJsonIfExists<AccessibilityConsolidatedReport>(
-    path.join(fromRun, "accessibility", "consolidated.json")
+    path.join(fromRunDir, "accessibility", "consolidated.json")
   );
   const toA11y = await readJsonIfExists<AccessibilityConsolidatedReport>(
-    path.join(toRun, "accessibility", "consolidated.json")
+    path.join(toRunDir, "accessibility", "consolidated.json")
   );
   const fromMap = indexViolations(fromA11y);
   const toMap = indexViolations(toA11y);
 
-  const addedViolations = [...toMap.entries()]
-    .filter(([fingerprint]) => !fromMap.has(fingerprint))
-    .map(([, value]) => value);
-  const fixedViolations = [...fromMap.entries()]
-    .filter(([fingerprint]) => !toMap.has(fingerprint))
-    .map(([, value]) => value);
-  const unchangedCount = [...toMap.keys()].filter((fingerprint) => fromMap.has(fingerprint)).length;
-
-  const fromByDevice = await loadLighthouseByDeviceForCompare(fromRun);
-  const toByDevice = await loadLighthouseByDeviceForCompare(toRun);
+  const fromByDevice = await loadLighthouseByDeviceForCompare(fromRunDir);
+  const toByDevice = await loadLighthouseByDeviceForCompare(toRunDir);
   const endpointBlocks = buildPerformanceByDevice(fromByDevice, toByDevice, fromDate, toDate);
-  const historyRuns = await selectHistoryRuns(resolveOutputRoot(config), fromDate, toDate);
+  const historyRuns = await selectHistoryRuns(
+    resolveOutputRoot(config),
+    options.historyFromDate,
+    toDate
+  );
   const performanceByDevice = await attachHistoricalSheetGroups(endpointBlocks, historyRuns, toUrls);
-  const performance = primaryDevicePerformance(performanceByDevice, config.LIGHTHOUSE_DEVICE);
-
   const fromPrimary =
     fromByDevice[config.LIGHTHOUSE_DEVICE] ??
     fromByDevice.desktop ??
@@ -70,19 +68,39 @@ export async function compareRuns(
   const toPrimary =
     toByDevice[config.LIGHTHOUSE_DEVICE] ?? toByDevice.desktop ?? toByDevice.mobile ?? null;
 
-  const report: ComparisonReport = {
+  return {
     generatedAt: new Date().toISOString(),
-    from: { date: fromDate, runDir: fromRun, provider: resolveReportProvider(fromPrimary) },
-    to: { date: toDate, runDir: toRun, provider: resolveReportProvider(toPrimary) },
-    urls: { added, removed, shared },
-    accessibility: {
-      addedViolations,
-      fixedViolations,
-      unchangedCount
+    from: { date: fromDate, runDir: fromRunDir, provider: resolveReportProvider(fromPrimary) },
+    to: { date: toDate, runDir: toRunDir, provider: resolveReportProvider(toPrimary) },
+    urls: {
+      added: toUrls.filter((url) => !fromSet.has(url)),
+      removed: fromUrls.filter((url) => !toSet.has(url)),
+      shared: toUrls.filter((url) => fromSet.has(url))
     },
-    performance,
+    accessibility: {
+      addedViolations: [...toMap.entries()]
+        .filter(([fingerprint]) => !fromMap.has(fingerprint))
+        .map(([, value]) => value),
+      fixedViolations: [...fromMap.entries()]
+        .filter(([fingerprint]) => !toMap.has(fingerprint))
+        .map(([, value]) => value),
+      unchangedCount: [...toMap.keys()].filter((fingerprint) => fromMap.has(fingerprint)).length
+    },
+    performance: primaryDevicePerformance(performanceByDevice, config.LIGHTHOUSE_DEVICE),
     performanceByDevice
   };
+}
+
+export async function compareRuns(
+  config: AppConfig,
+  fromDate: string,
+  toDate: string
+): Promise<ComparisonReport> {
+  const fromRun = await latestRunForDate(config, fromDate);
+  const toRun = await latestRunForDate(config, toDate);
+  const report = await buildComparisonReport(config, fromRun, toRun, fromDate, toDate, {
+    historyFromDate: fromDate
+  });
 
   const outDir = path.join(resolveOutputRoot(config), "comparisons", `${fromDate}_vs_${toDate}`);
   await writeJson(path.join(outDir, "delta.json"), report);
@@ -154,10 +172,6 @@ function fmtDelta(value: number | null, suffix = ""): string {
   return suffix ? `${signed}${suffix}` : signed;
 }
 
-function capitalize(value: string): string {
-  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
-}
-
 async function latestRunForDate(config: AppConfig, date: string): Promise<string> {
   const dateDir = path.join(resolveOutputRoot(config), date);
   if (!existsSync(dateDir)) {
@@ -174,20 +188,7 @@ async function latestRunForDate(config: AppConfig, date: string): Promise<string
   return path.join(dateDir, latest);
 }
 
-async function readUrls(config: AppConfig, runDir: string): Promise<string[]> {
-  const flat = resolveInventoryFlatPath(config, runDir);
-  const inventory = JSON.parse(await readFile(flat, "utf8")) as FlatUrlInventory;
-  return inventory.urls;
-}
-
-async function readJsonIfExists<T>(filePath: string): Promise<T | undefined> {
-  if (!existsSync(filePath)) {
-    return undefined;
-  }
-  return JSON.parse(await readFile(filePath, "utf8")) as T;
-}
-
-function indexViolations(report: AccessibilityConsolidatedReport | undefined) {
+function indexViolations(report: AccessibilityConsolidatedReport | null) {
   const map = new Map<
     string,
     { url: string; fingerprint: string; id: string; impact: string | null; help: string }

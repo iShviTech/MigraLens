@@ -1,147 +1,204 @@
-#!/usr/bin/env node
-/**
- * MigraLens — generate-comparison-report.js
- *
- * Compares the latest audit run against the previous one, embeds per-page history
- * across all reports/YYYY-MM-DD/HHMMSS runs, and writes a self-contained dashboard:
- *   ./reports/comparison-report.html
- *
- * Features:
- *   - Page Selector dropdown (filters metrics / a11y / charts to the chosen URL)
- *   - SVG line charts for historical Lighthouse scores + Core Web Vitals
- *
- * Usage:
- *   node scripts/generate-comparison-report.js
- *   node scripts/generate-comparison-report.js --to 2026-09-21/160646
- *   node scripts/generate-comparison-report.js --from 2026-09-20/123528 --to 2026-09-21/160646
- */
-
 import { existsSync } from "node:fs";
-import { readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { writeFile } from "node:fs/promises";
+import type { AppConfig } from "../config/env.js";
+import { listAllRuns, type AuditRunRef } from "../compare/history.js";
+import type {
+  AccessibilityConsolidatedReport,
+  FlatUrlInventory,
+  LighthouseConsolidatedReport,
+  LighthouseScores,
+  NormalizedViolation
+} from "../types.js";
+import { readJsonIfExists } from "../utils/fs.js";
+import { escapeHtml } from "../utils/html.js";
+import { logInfo } from "../utils/logger.js";
+import { resolveOutputRoot, urlInventoryDir } from "../utils/run-context.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, "..");
-const REPORTS_ROOT = path.join(PROJECT_ROOT, "reports");
-const URL_INVENTORY_DIR = path.join(REPORTS_ROOT, "url");
-const OUTPUT_PATH = path.join(REPORTS_ROOT, "comparison-report.html");
-
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const STAMP_RE = /^\d{6}$/;
-
-async function main() {
-  const argv = process.argv.slice(2);
-  const toId = readArg(argv, ["--to", "--run", "--run-id"]);
-  const fromId = readArg(argv, ["--from"]);
-
-  const allRuns = await listAllRuns(REPORTS_ROOT);
-  if (!allRuns.length) {
-    throw new Error(`No audit runs found under ${REPORTS_ROOT}. Expected YYYY-MM-DD/HHMMSS folders.`);
-  }
-
-  const toRun = toId ? await resolveRunById(toId) : allRuns.at(-1);
-  const fromRun = fromId
-    ? await resolveRunById(fromId)
-    : pickPreviousRun(allRuns, toRun) ?? toRun;
-
-  console.log(`Baseline: ${fromRun.key}`);
-  console.log(`Current:  ${toRun.key}`);
-  console.log(`History:  ${allRuns.length} run(s)`);
-
-  const payload = await buildCompareData(allRuns, fromRun, toRun);
-  const html = renderHtml(payload);
-  await writeFile(OUTPUT_PATH, html, "utf8");
-
-  console.log(`Wrote ${OUTPUT_PATH}`);
-  console.log(`  pages: ${payload.pages.length}`);
-  console.log(`  default: ${payload.meta.defaultUrl}`);
+export interface RootComparisonArgs {
+  from?: string;
+  to?: string;
+  run?: string;
 }
 
-function readArg(argv, flags) {
+interface CompactVitals {
+  lcpMs: number | null;
+  cls: number | null;
+  inpMs: number | null;
+  tbtMs: number | null;
+  fcpMs: number | null;
+  siMs: number | null;
+  ttiMs: number | null;
+}
+
+interface CompactViolation {
+  id: string;
+  impact: string | null;
+  help: string;
+  fingerprint: string;
+  target: string[];
+}
+
+interface SnapshotPage {
+  url: string;
+  scores: LighthouseScores | null;
+  vitals: CompactVitals;
+  violationCount: number;
+  violations: CompactViolation[];
+}
+
+interface RunSnapshot {
+  key: string;
+  date: string;
+  timestamp: string;
+  label: string;
+  targetUrl: string | null;
+  urls: string[];
+  urlSet: Set<string>;
+  averageScores: LighthouseScores;
+  averageVitals: CompactVitals;
+  totalViolations: number;
+  pages: Map<string, SnapshotPage>;
+}
+
+interface RootCompareData {
+  meta: {
+    generatedAt: string;
+    targetUrl: string;
+    defaultUrl: string;
+    isBaseline: boolean;
+    from: { date: string; timestamp: string; key: string; runDir: string };
+    to: { date: string; timestamp: string; key: string; runDir: string };
+    runCount: number;
+    pageCount: number;
+    urls: { added: string[]; removed: string[]; shared: string[] };
+  };
+  runs: Array<{ key: string; date: string; timestamp: string; label: string }>;
+  site: {
+    fromScores: LighthouseScores;
+    toScores: LighthouseScores;
+    deltas: LighthouseScores;
+    history: Array<{
+      runKey: string;
+      label: string;
+      scores: LighthouseScores;
+      vitals: CompactVitals;
+      totalViolations: number;
+    }>;
+  };
+  pages: Array<{
+    url: string;
+    from: { scores: LighthouseScores | null; vitals: CompactVitals; violationCount: number } | null;
+    to: { scores: LighthouseScores | null; vitals: CompactVitals; violationCount: number } | null;
+    deltas: { scores: LighthouseScores; vitals: CompactVitals };
+    a11y: { added: CompactViolation[]; fixed: CompactViolation[] };
+    history: Array<{
+      runKey: string;
+      label: string;
+      scores: LighthouseScores | null;
+      vitals: CompactVitals;
+      violationCount: number | null;
+    }>;
+  }>;
+}
+
+export function parseRootComparisonArgs(argv: string[]): RootComparisonArgs {
+  const args: RootComparisonArgs = {};
   for (let i = 0; i < argv.length; i += 1) {
-    if (flags.includes(argv[i])) {
-      return argv[i + 1];
+    const token = argv[i];
+    if (token === "--from") {
+      args.from = argv[i + 1];
+      i += 1;
+    } else if (token === "--to") {
+      args.to = argv[i + 1];
+      i += 1;
+    } else if (token === "--run" || token === "--run-id") {
+      args.run = argv[i + 1];
+      args.to = args.to ?? argv[i + 1];
+      i += 1;
     }
   }
-  return undefined;
+  return args;
 }
 
-function pickPreviousRun(allRuns, toRun) {
+export async function writeRootComparisonReport(
+  config: AppConfig,
+  args: RootComparisonArgs = {}
+): Promise<string> {
+  const reportsRoot = resolveOutputRoot(config);
+  const allRuns = await listAllRuns(reportsRoot);
+  if (!allRuns.length) {
+    throw new Error(`No audit runs found under ${reportsRoot}. Expected YYYY-MM-DD/HHmmss folders.`);
+  }
+
+  const toId = args.to ?? args.run;
+  const toRun = toId ? resolveRunById(reportsRoot, toId, allRuns) : allRuns.at(-1)!;
+  const fromRun = args.from
+    ? resolveRunById(reportsRoot, args.from, allRuns)
+    : pickPreviousRun(allRuns, toRun) ?? toRun;
+
+  const payload = await buildCompareData(config, allRuns, fromRun, toRun);
+  const html = renderHtml(payload);
+  const outputPath = path.join(reportsRoot, "comparison-report.html");
+  await writeFile(outputPath, html, "utf8");
+  logInfo("Wrote root comparison HTML report", {
+    outputPath,
+    pages: payload.pages.length,
+    defaultUrl: payload.meta.defaultUrl,
+    from: fromRun.key,
+    to: toRun.key
+  });
+  return outputPath;
+}
+
+function pickPreviousRun(allRuns: AuditRunRef[], toRun: AuditRunRef): AuditRunRef | null {
   const index = allRuns.findIndex((run) => run.key === toRun.key);
   if (index <= 0) {
     return null;
   }
-  return allRuns[index - 1];
+  return allRuns[index - 1] ?? null;
 }
 
-async function resolveRunById(runId) {
+function resolveRunById(root: string, runId: string, allRuns: AuditRunRef[]): AuditRunRef {
   const [date, timestamp] = String(runId).split("/").filter(Boolean);
-  if (!date || !timestamp || !DATE_RE.test(date) || !STAMP_RE.test(timestamp)) {
+  if (!date || !timestamp || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{6}$/.test(timestamp)) {
     throw new Error(`RUN_ID must look like YYYY-MM-DD/HHmmss, received "${runId}"`);
   }
-  const runDir = path.join(REPORTS_ROOT, date, timestamp);
-  if (!existsSync(runDir)) {
-    throw new Error(`Run folder not found: ${runDir}`);
+  const existing = allRuns.find((run) => run.key === `${date}/${timestamp}`);
+  if (existing) {
+    return existing;
   }
+  const runDir = path.join(root, date, timestamp);
   return { date, timestamp, runDir, key: `${date}/${timestamp}` };
 }
 
-async function listAllRuns(root) {
-  if (!existsSync(root)) {
-    return [];
-  }
-  const dates = (await readdir(root, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory() && DATE_RE.test(entry.name))
-    .map((entry) => entry.name)
-    .sort();
-
-  const runs = [];
-  for (const date of dates) {
-    const dateDir = path.join(root, date);
-    const stamps = (await readdir(dateDir, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && STAMP_RE.test(entry.name))
-      .map((entry) => entry.name)
-      .sort();
-    for (const timestamp of stamps) {
-      runs.push({
-        date,
-        timestamp,
-        runDir: path.join(dateDir, timestamp),
-        key: `${date}/${timestamp}`
-      });
-    }
-  }
-  return runs;
-}
-
-/** Prefer legacy per-run inventory copy; otherwise shared reports/url/. */
-function resolveInventoryFile(runDir, fileName) {
+function resolveInventoryFile(config: AppConfig, runDir: string, fileName: string): string {
   const local = path.join(runDir, fileName);
   if (existsSync(local)) {
     return local;
   }
-  return path.join(URL_INVENTORY_DIR, fileName);
+  return path.join(urlInventoryDir(config), fileName);
 }
 
-async function buildCompareData(allRuns, fromRun, toRun) {
-  const snapshots = [];
+async function buildCompareData(
+  config: AppConfig,
+  allRuns: AuditRunRef[],
+  fromRun: AuditRunRef,
+  toRun: AuditRunRef
+): Promise<RootCompareData> {
+  const snapshots: RunSnapshot[] = [];
   for (const run of allRuns) {
-    snapshots.push(await loadRunSnapshot(run));
+    snapshots.push(await loadRunSnapshot(config, run));
   }
 
-  const fromSnap = snapshots.find((snap) => snap.key === fromRun.key) ?? (await loadRunSnapshot(fromRun));
-  const toSnap = snapshots.find((snap) => snap.key === toRun.key) ?? (await loadRunSnapshot(toRun));
+  const fromSnap = snapshots.find((snap) => snap.key === fromRun.key) ?? (await loadRunSnapshot(config, fromRun));
+  const toSnap = snapshots.find((snap) => snap.key === toRun.key) ?? (await loadRunSnapshot(config, toRun));
 
   const urls = [
-    ...new Set([
-      ...fromSnap.urls,
-      ...toSnap.urls,
-      ...snapshots.flatMap((snap) => snap.urls)
-    ])
+    ...new Set([...fromSnap.urls, ...toSnap.urls, ...snapshots.flatMap((snap) => snap.urls)])
   ].sort();
 
-  const targetUrl = toSnap.targetUrl ?? fromSnap.targetUrl ?? "https://www.materialplus.io";
+  const targetUrl = toSnap.targetUrl ?? fromSnap.targetUrl ?? config.TARGET_URL;
   const defaultUrl = pickDefaultUrl(urls, targetUrl);
   const isBaseline = fromRun.key === toRun.key;
 
@@ -159,8 +216,6 @@ async function buildCompareData(allRuns, fromRun, toRun) {
       };
     });
 
-    const a11y = diffA11yForUrl(url, fromPage, toPage);
-
     return {
       url,
       from: compactPage(fromPage),
@@ -169,7 +224,7 @@ async function buildCompareData(allRuns, fromRun, toRun) {
         scores: deltaScores(fromPage?.scores ?? null, toPage?.scores ?? null),
         vitals: deltaVitals(fromPage?.vitals ?? null, toPage?.vitals ?? null)
       },
-      a11y,
+      a11y: diffA11yForUrl(fromPage, toPage),
       history
     };
   });
@@ -212,18 +267,22 @@ async function buildCompareData(allRuns, fromRun, toRun) {
   };
 }
 
-async function loadRunSnapshot(run) {
-  const inventory = await readJson(resolveInventoryFile(run.runDir, "urls-flat.json"));
-  const lighthouse = await readJson(path.join(run.runDir, "lighthouse", "consolidated.json"));
-  const accessibility = await readJson(path.join(run.runDir, "accessibility", "consolidated.json"));
+async function loadRunSnapshot(config: AppConfig, run: AuditRunRef): Promise<RunSnapshot> {
+  const inventory = await readJsonIfExists<FlatUrlInventory>(
+    resolveInventoryFile(config, run.runDir, "urls-flat.json")
+  );
+  const lighthouse = await readJsonIfExists<LighthouseConsolidatedReport>(
+    path.join(run.runDir, "lighthouse", "consolidated.json")
+  );
+  const accessibility = await readJsonIfExists<AccessibilityConsolidatedReport>(
+    path.join(run.runDir, "accessibility", "consolidated.json")
+  );
 
   const lhByUrl = new Map((lighthouse?.pages ?? []).map((page) => [page.url, page]));
   const a11yByUrl = new Map((accessibility?.pages ?? []).map((page) => [page.url, page]));
-  const urls = [
-    ...new Set([...(inventory?.urls ?? []), ...lhByUrl.keys(), ...a11yByUrl.keys()])
-  ].sort();
+  const urls = [...new Set([...(inventory?.urls ?? []), ...lhByUrl.keys(), ...a11yByUrl.keys()])].sort();
 
-  const pages = new Map();
+  const pages = new Map<string, SnapshotPage>();
   for (const url of urls) {
     const lh = lhByUrl.get(url);
     const a11y = a11yByUrl.get(url);
@@ -239,12 +298,13 @@ async function loadRunSnapshot(run) {
             pwa: lh.scores.pwa ?? null
           }
         : null,
-      vitals: hydrateVitals(lh),
+      vitals: hydrateSnapshotVitals(lh),
       violationCount: a11y?.summary?.violationCount ?? violations.length,
       violations
     });
   }
 
+  const pageList = [...pages.values()];
   return {
     key: run.key,
     date: run.date,
@@ -253,14 +313,16 @@ async function loadRunSnapshot(run) {
     targetUrl: inventory?.targetUrl ?? null,
     urls,
     urlSet: new Set(urls),
-    averageScores: lighthouse?.averageScores ?? averageScores([...pages.values()]),
-    averageVitals: averageVitals([...pages.values()]),
-    totalViolations: accessibility?.totalViolations ?? [...pages.values()].reduce((sum, page) => sum + (page.violationCount ?? 0), 0),
+    averageScores: lighthouse?.averageScores ?? averageScores(pageList),
+    averageVitals: averageVitals(pageList),
+    totalViolations:
+      accessibility?.totalViolations ??
+      pageList.reduce((sum, page) => sum + (page.violationCount ?? 0), 0),
     pages
   };
 }
 
-function compactPage(page) {
+function compactPage(page: SnapshotPage | null) {
   if (!page) {
     return null;
   }
@@ -271,7 +333,7 @@ function compactPage(page) {
   };
 }
 
-function compactViolation(url, item) {
+function compactViolation(url: string, item: NormalizedViolation): CompactViolation {
   const target = (item.nodes?.[0]?.target ?? []).map(String);
   return {
     id: item.id,
@@ -282,7 +344,7 @@ function compactViolation(url, item) {
   };
 }
 
-function diffA11yForUrl(url, fromPage, toPage) {
+function diffA11yForUrl(fromPage: SnapshotPage | null, toPage: SnapshotPage | null) {
   const fromMap = new Map((fromPage?.violations ?? []).map((item) => [item.fingerprint, item]));
   const toMap = new Map((toPage?.violations ?? []).map((item) => [item.fingerprint, item]));
   const added = [...toMap.values()].filter((item) => !fromMap.has(item.fingerprint));
@@ -290,14 +352,9 @@ function diffA11yForUrl(url, fromPage, toPage) {
   return { added, fixed };
 }
 
-function pickDefaultUrl(urls, targetUrl) {
+function pickDefaultUrl(urls: string[], targetUrl: string): string {
   const normalizedTarget = String(targetUrl || "").replace(/\/$/, "");
-  const preferences = [
-    `${normalizedTarget}/`,
-    normalizedTarget,
-    "https://www.materialplus.io/",
-    "https://www.materialplus.io"
-  ];
+  const preferences = [`${normalizedTarget}/`, normalizedTarget];
   for (const candidate of preferences) {
     if (urls.includes(candidate)) {
       return candidate;
@@ -314,7 +371,7 @@ function pickDefaultUrl(urls, targetUrl) {
   return home ?? urls[0] ?? targetUrl;
 }
 
-function emptyVitals() {
+function emptyVitals(): CompactVitals {
   return {
     lcpMs: null,
     cls: null,
@@ -326,18 +383,37 @@ function emptyVitals() {
   };
 }
 
-function hydrateVitals(page) {
+function hydrateSnapshotVitals(
+  page: LighthouseConsolidatedReport["pages"][number] | undefined
+): CompactVitals {
   const empty = emptyVitals();
   if (!page) {
     return empty;
   }
-  const current = page.coreWebVitals ?? empty;
+  const current = { ...empty, ...(page.coreWebVitals ?? {}) };
   if (Object.values(current).some((value) => typeof value === "number")) {
-    return { ...empty, ...current };
+    return {
+      lcpMs: current.lcpMs,
+      cls: current.cls,
+      inpMs: current.inpMs,
+      tbtMs: current.tbtMs,
+      fcpMs: current.fcpMs,
+      siMs: current.siMs,
+      ttiMs: current.ttiMs
+    };
   }
-  const metrics = page.raw?.metrics;
+  const raw = page.raw as { metrics?: Record<string, unknown> } | null | undefined;
+  const metrics = raw?.metrics;
   if (!metrics || typeof metrics !== "object") {
-    return { ...empty, ...current };
+    return {
+      lcpMs: current.lcpMs,
+      cls: current.cls,
+      inpMs: current.inpMs,
+      tbtMs: current.tbtMs,
+      fcpMs: current.fcpMs,
+      siMs: current.siMs,
+      ttiMs: current.ttiMs
+    };
   }
   return {
     lcpMs: metricValue(metrics, "largest-contentful-paint"),
@@ -350,25 +426,39 @@ function hydrateVitals(page) {
   };
 }
 
-function metricValue(metrics, key) {
+function metricValue(metrics: Record<string, unknown>, key: string): number | null {
   const entry = metrics[key];
   if (typeof entry === "number") {
     return entry;
   }
   if (entry && typeof entry === "object") {
-    const value = entry.value ?? entry.numericValue;
+    const value =
+      (entry as { value?: unknown; numericValue?: unknown }).value ??
+      (entry as { numericValue?: unknown }).numericValue;
     return typeof value === "number" ? value : null;
   }
   return null;
 }
 
-function averageScores(pages) {
-  const keys = ["performance", "accessibility", "bestPractices", "seo", "pwa"];
-  const result = {};
+function averageScores(pages: Array<{ scores: LighthouseScores | null }>): LighthouseScores {
+  const keys: Array<keyof LighthouseScores> = [
+    "performance",
+    "accessibility",
+    "bestPractices",
+    "seo",
+    "pwa"
+  ];
+  const result: LighthouseScores = {
+    performance: null,
+    accessibility: null,
+    bestPractices: null,
+    seo: null,
+    pwa: null
+  };
   for (const key of keys) {
     const values = pages
       .map((page) => page.scores?.[key])
-      .filter((value) => typeof value === "number");
+      .filter((value): value is number => typeof value === "number");
     result[key] = values.length
       ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
       : null;
@@ -376,13 +466,21 @@ function averageScores(pages) {
   return result;
 }
 
-function averageVitals(pages) {
-  const keys = ["lcpMs", "cls", "inpMs", "tbtMs", "fcpMs", "siMs", "ttiMs"];
-  const result = {};
+function averageVitals(pages: Array<{ vitals: CompactVitals }>): CompactVitals {
+  const keys: Array<keyof CompactVitals> = [
+    "lcpMs",
+    "cls",
+    "inpMs",
+    "tbtMs",
+    "fcpMs",
+    "siMs",
+    "ttiMs"
+  ];
+  const result = emptyVitals();
   for (const key of keys) {
     const values = pages
       .map((page) => page.vitals?.[key])
-      .filter((value) => typeof value === "number");
+      .filter((value): value is number => typeof value === "number");
     if (!values.length) {
       result[key] = null;
       continue;
@@ -393,38 +491,49 @@ function averageVitals(pages) {
   return result;
 }
 
-function deltaScores(from, to) {
-  const keys = ["performance", "accessibility", "bestPractices", "seo", "pwa"];
-  const result = {};
+function deltaScores(from: LighthouseScores | null, to: LighthouseScores | null): LighthouseScores {
+  const keys: Array<keyof LighthouseScores> = [
+    "performance",
+    "accessibility",
+    "bestPractices",
+    "seo",
+    "pwa"
+  ];
+  const result: LighthouseScores = {
+    performance: null,
+    accessibility: null,
+    bestPractices: null,
+    seo: null,
+    pwa: null
+  };
   for (const key of keys) {
     const before = from?.[key];
     const after = to?.[key];
-    result[key] =
-      typeof before === "number" && typeof after === "number" ? after - before : null;
+    result[key] = typeof before === "number" && typeof after === "number" ? after - before : null;
   }
   return result;
 }
 
-function deltaVitals(from, to) {
-  const keys = ["lcpMs", "cls", "inpMs", "tbtMs", "fcpMs", "siMs", "ttiMs"];
-  const result = {};
+function deltaVitals(from: CompactVitals | null, to: CompactVitals | null): CompactVitals {
+  const keys: Array<keyof CompactVitals> = [
+    "lcpMs",
+    "cls",
+    "inpMs",
+    "tbtMs",
+    "fcpMs",
+    "siMs",
+    "ttiMs"
+  ];
+  const result = emptyVitals();
   for (const key of keys) {
     const before = from?.[key];
     const after = to?.[key];
-    result[key] =
-      typeof before === "number" && typeof after === "number" ? after - before : null;
+    result[key] = typeof before === "number" && typeof after === "number" ? after - before : null;
   }
   return result;
 }
 
-async function readJson(filePath) {
-  if (!existsSync(filePath)) {
-    return null;
-  }
-  return JSON.parse(await readFile(filePath, "utf8"));
-}
-
-function renderHtml(data) {
+function renderHtml(data: RootCompareData): string {
   const dataJson = JSON.stringify(data).replace(/</g, "\\u003c");
   const fromLabel = escapeHtml(data.meta.from.key);
   const toLabel = escapeHtml(data.meta.to.key);
@@ -856,14 +965,6 @@ ${REPORT_CSS}
 </html>`;
 }
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
 
 const REPORT_CSS = `
 :root {
@@ -1021,8 +1122,3 @@ pre {
   th, td { font-size: 0.85rem; }
 }
 `;
-
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});

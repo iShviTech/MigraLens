@@ -93,11 +93,12 @@ export async function runPerformanceAudit(
     const { writeRunHtmlReports } = await import("../report/generate.js");
     await writeRunHtmlReports(config, ctx);
   }
+  const deviceEntries = [...results];
   logInfo("Performance audits finished", {
     provider,
     devices,
-    pages: Object.fromEntries([...results].map(([device, bucket]) => [device, bucket.pages.length])),
-    failed: Object.fromEntries([...results].map(([device, bucket]) => [device, bucket.failures.length])),
+    pages: Object.fromEntries(deviceEntries.map(([device, bucket]) => [device, bucket.pages.length])),
+    failed: Object.fromEntries(deviceEntries.map(([device, bucket]) => [device, bucket.failures.length])),
     runDir: ctx.runDir
   });
 }

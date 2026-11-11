@@ -364,17 +364,6 @@ export async function runBrokenLinkCheck(config: AppConfig): Promise<CheckLinksR
   }
 }
 
-/** Filename-safe slug for a page URL (used by report writer). */
-export function pageUrlSlug(url: string): string {
-  return (
-    url
-      .replace(/^https?:\/\//i, "")
-      .replace(/[^a-zA-Z0-9._-]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 180) || "root"
-  );
-}
-
 export function brokenLinksRunDir(outputRoot: string, date: string, timestamp: string): string {
   return path.join(outputRoot, "broken-links", date, timestamp);
 }

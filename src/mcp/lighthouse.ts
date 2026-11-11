@@ -1,8 +1,8 @@
 import type { AppConfig } from "../config/env.js";
-import type { LighthouseDevice, LighthousePageReport, PerfAuditResult } from "../types.js";
+import type { LighthouseDevice, PerfAuditResult } from "../types.js";
 import { categoryForUrl } from "../crawler/categorize.js";
 import { McpClientPool, McpStdioClient } from "./client.js";
-import { extractCoreWebVitals, extractScores, renderPerfHtml } from "../perf/extract.js";
+import { extractCoreWebVitals, extractScores } from "../perf/extract.js";
 
 export function createLighthousePool(config: AppConfig): McpClientPool {
   return new McpClientPool(config.CONCURRENCY_LIMIT, () => new McpStdioClient(config.LIGHTHOUSE_MCP_CMD));
@@ -67,9 +67,4 @@ async function resolveToolName(
     return preferred;
   }
   return preferred;
-}
-
-/** @deprecated Prefer renderPerfHtml — kept for existing imports. */
-export function renderLighthouseHtml(report: LighthousePageReport): string {
-  return renderPerfHtml(report);
 }

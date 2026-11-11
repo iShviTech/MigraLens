@@ -6,6 +6,7 @@ import type {
   LighthouseScores,
   PerfProvider
 } from "../types.js";
+import { escapeHtml } from "../utils/html.js";
 
 export function resolvePerfProvider(
   value: PerfProvider | string | null | undefined
@@ -249,7 +250,7 @@ function cruxMetricValue(
 }
 
 export function renderPerfHtml(report: LighthousePageReport): string {
-  const providerLabel = report.provider === "pagespeed" ? "PageSpeed Insights" : "Lighthouse";
+  const label = resolvePerfProvider(report.provider) === "pagespeed" ? "PageSpeed Insights" : "Lighthouse";
   const rows = Object.entries(report.scores)
     .map(([name, score]) => `<tr><td>${escapeHtml(name)}</td><td>${score ?? "n/a"}</td></tr>`)
     .join("");
@@ -266,7 +267,7 @@ export function renderPerfHtml(report: LighthousePageReport): string {
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>${escapeHtml(providerLabel)} — ${escapeHtml(report.url)}</title>
+  <title>${escapeHtml(label)} — ${escapeHtml(report.url)}</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; color: #111; }
     table { border-collapse: collapse; min-width: 320px; }
@@ -275,7 +276,7 @@ export function renderPerfHtml(report: LighthousePageReport): string {
   </style>
 </head>
 <body>
-  <h1>${escapeHtml(providerLabel)} audit</h1>
+  <h1>${escapeHtml(label)} audit</h1>
   <p><strong>URL:</strong> ${escapeHtml(report.url)}</p>
   <p><strong>Provider:</strong> ${escapeHtml(report.provider)} · <strong>Device:</strong> ${escapeHtml(report.device)} · <strong>Scanned:</strong> ${escapeHtml(report.scannedAt)}</p>
   <h2>Category scores</h2>
@@ -291,14 +292,6 @@ export function renderPerfHtml(report: LighthousePageReport): string {
 </body>
 </html>
 `;
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
 }
 
 const MAX_AUDIT_NODES = 15;

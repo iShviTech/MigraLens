@@ -6,8 +6,6 @@ import { logInfo, logWarn } from "../utils/logger.js";
 import { withRetry } from "../utils/retry.js";
 import { groupUrlsByCategory } from "./categorize.js";
 
-export { normalizeUrl } from "../links/classify.js";
-
 export interface CrawlResult {
   flat: FlatUrlInventory;
   categorized: CategorizedUrlInventory;

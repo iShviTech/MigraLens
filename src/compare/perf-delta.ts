@@ -2,34 +2,42 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { extractCoreWebVitals } from "../perf/extract.js";
-import { hydrateVitals } from "../report/shared.js";
+import { REPORT_DEVICES, hydrateVitals, mergeVitals } from "../report/shared.js";
 import type {
   ComparisonDeviceBlock,
   ComparisonDevicePageDelta,
   ComparisonSheetRun,
   ComparisonSheetUrlGroup,
   ComparisonVitals,
-  CoreWebVitals,
   LighthouseConsolidatedReport,
   LighthouseDevice,
   LighthousePageReport,
   LighthouseScores
 } from "../types.js";
-import { urlToFilename } from "../utils/fs.js";
+import { readJsonIfExists, urlToFilename } from "../utils/fs.js";
 import type { HistoryRunRef } from "./history.js";
 
-const DEVICES: LighthouseDevice[] = ["mobile", "desktop"];
+export interface LoadLighthouseOptions {
+  enrichVitals?: boolean;
+  backfillFiles?: boolean;
+}
 
-export async function loadLighthouseByDeviceForCompare(
-  runDir: string
+/**
+ * Per-device consolidated reports (`lighthouse/{device}/consolidated.json`).
+ * Legacy runs with only `lighthouse/consolidated.json` are filed under their own device.
+ */
+export async function loadLighthouseByDevice(
+  runDir: string,
+  options: LoadLighthouseOptions = {}
 ): Promise<Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>>> {
+  const { enrichVitals = false, backfillFiles = false } = options;
   const result: Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>> = {};
-  for (const device of DEVICES) {
+  for (const device of REPORT_DEVICES) {
     const report = await readJsonIfExists<LighthouseConsolidatedReport>(
       path.join(runDir, "lighthouse", device, "consolidated.json")
     );
     if (report) {
-      result[device] = await enrichConsolidated(runDir, report, device);
+      result[device] = enrichVitals ? await enrichConsolidated(runDir, report, device) : report;
     }
   }
   if (Object.keys(result).length > 0) {
@@ -43,8 +51,29 @@ export async function loadLighthouseByDeviceForCompare(
   }
   const device: LighthouseDevice =
     legacy.device ?? (legacy.pages[0]?.device === "mobile" ? "mobile" : "desktop");
-  result[device] = await enrichConsolidated(runDir, legacy, device);
+  if (backfillFiles) {
+    for (const page of legacy.pages) {
+      if (page.files) {
+        continue;
+      }
+      const stem = urlToFilename(page.url);
+      const html = `lighthouse/by-url/${stem}.html`;
+      const json = `lighthouse/by-url/${stem}.json`;
+      page.files = {
+        html: existsSync(path.join(runDir, html)) ? html : null,
+        json: existsSync(path.join(runDir, json)) ? json : null
+      };
+    }
+  }
+  result[device] = enrichVitals ? await enrichConsolidated(runDir, legacy, device) : legacy;
   return result;
+}
+
+/** Compare/dashboard path: enrich page vitals from by-url JSON when needed. */
+export async function loadLighthouseByDeviceForCompare(
+  runDir: string
+): Promise<Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>>> {
+  return loadLighthouseByDevice(runDir, { enrichVitals: true });
 }
 
 async function enrichConsolidated(
@@ -91,23 +120,13 @@ async function enrichPageVitals(
   return { ...page, coreWebVitals: vitals };
 }
 
-function mergeVitals(base: CoreWebVitals, fill: CoreWebVitals): CoreWebVitals {
-  const result = { ...base };
-  for (const key of Object.keys(fill) as Array<keyof CoreWebVitals>) {
-    if (result[key] == null && fill[key] != null) {
-      result[key] = fill[key];
-    }
-  }
-  return result;
-}
-
 export function buildPerformanceByDevice(
   fromByDevice: Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>>,
   toByDevice: Partial<Record<LighthouseDevice, LighthouseConsolidatedReport>>,
   fromDate?: string,
   toDate?: string
 ): ComparisonDeviceBlock[] {
-  const devices = DEVICES.filter((device) => fromByDevice[device] || toByDevice[device]);
+  const devices = REPORT_DEVICES.filter((device) => fromByDevice[device] || toByDevice[device]);
   return devices.map((device) => {
     const fromReport = fromByDevice[device] ?? null;
     const toReport = toByDevice[device] ?? null;
@@ -446,11 +465,4 @@ export function deltaScores(from: LighthouseScores | null, to: LighthouseScores 
 
 export function numericDelta(from: number | null, to: number | null): number | null {
   return from !== null && to !== null ? to - from : null;
-}
-
-async function readJsonIfExists<T>(filePath: string): Promise<T | undefined> {
-  if (!existsSync(filePath)) {
-    return undefined;
-  }
-  return JSON.parse(await readFile(filePath, "utf8")) as T;
 }
