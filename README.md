@@ -254,3 +254,151 @@ Each completed audit writes self-contained HTML into the run folder and refreshe
 - Freeze `MAX_CRAWL_DEPTH`, `MAX_URLS`, `PERF_PROVIDER`, `LIGHTHOUSE_DEVICE`, and `LIGHTHOUSE_THROTTLING` between WordPress and Drupal runs so deltas are comparable.
 - Keep `CONCURRENCY_LIMIT` modest; a11y shares one Chromium browser, while each Lighthouse slot starts its own MCP stdio process. PageSpeed concurrency is limited by Google API quota.
 - Re-run `npm run scrape` only when the URL inventory should change; otherwise keep calling `npm run run-all` for fresh dated audit folders.
+
+## WCAG level checker
+
+`npm run accessibility` scans pages with Playwright and axe-core and reports each page as Below A, A, AA, or AAA. It writes a self-contained HTML roadmap plus CSV and JSON. By default the page list comes from `reports/url/top-urls.json`. If that file is missing or has no URLs, the run uses `reports/url/urls-flat.json`. When both files have URLs, every URL in each file must be the same website domain (`www` is ignored). A mismatch stops the run before the browser opens. `--config` and `--url` still scan only the pages you pass.
+
+```text
+Page     | Level    | Next | Issues to fix for next level
+Below A  | Below A  | A    | 6 rules, 8 elements
+Level A  | A        | AA   | 2 rules, 5 elements
+Level AA | AA       | AAA  | 1 rule, 2 elements
+Level AAA| AAA      | —    | None
+```
+
+### Goal
+
+Give a migration team a repeatable answer to "what WCAG level is this page at, and what do we fix next?" without claiming a formal conformance certificate.
+
+### Tools
+
+| Tool | Why |
+|---|---|
+| axe-core 4.13.0 | WCAG rule engine. Pinned to the same version `@axe-core/playwright` uses. |
+| Playwright | Opens each page, runs login and actions, and saves a screenshot. |
+| @axe-core/playwright | Runs axe inside the Playwright page through `AxeBuilder`. |
+
+### Phases
+
+| Phase | Deliverable | Effort | Status |
+|---|---|---|---|
+| Setup | Command and URL inventory | Small | Done |
+| Scanning engine | Playwright + axe, login, actions | Medium | Done |
+| Level logic | Below A / A / AA / AAA, roadmap, trend | Medium | Done |
+| Extra checks | Reflow and keyboard heuristics | Small | Done |
+| Reports | HTML, CSV, JSON | Medium | Done |
+| Automation | `--fail-below` and GitHub Actions | Small | Done |
+| Roll-out | Put the site URLs in `reports/url/top-urls.json` | Small | Waiting on URL list |
+| Manual audit | Human review of criteria with no automated test | Ongoing | Not started |
+
+### Roles
+
+- Developer: keeps the checker running and fixes the template issues it reports.
+- QA / accessibility tester: confirms review items and criteria that have no automated test.
+- Product owner: chooses the level the build must hold (`--fail-below`).
+
+### Timeline
+
+Week 1 is the build and a baseline scan. Week 2 is for Level A fixes. Weeks 3 and 4 are for Level AA. After that, pick specific AAA issues. W3C does not recommend requiring AAA for a whole site.
+
+### How the level is decided
+
+| Automated result | Current level |
+|---|---|
+| Any Level A rule fails | Below A |
+| Level A is clear, a Level AA rule fails | A |
+| Only Level AAA rules fail | AA |
+| No automated rule fails | AAA |
+
+Needs-review items (axe `incomplete` results and the reflow / keyboard heuristics) do not change the level unless `strictExtraChecks` is true. "Level" here means no automated failures. It is not a certificate. Automation finds roughly 30–57% of issues, and about 60% of WCAG 2.2 criteria need a person to check them.
+
+### Install
+
+```bash
+npm install
+npx playwright install chromium
+```
+
+If Chromium is already installed, set `A11Y_BROWSER_PATH` to that executable. It overrides `executablePath` when a config file is passed. Login credentials are read from `A11Y_USER` and `A11Y_PASS` unless the config names other variables. Do not put passwords in a file.
+
+### Optional config
+
+`npm run accessibility` does not need a config file. Pass `--config` only to override the inventory with `pages`, `login`, `waitFor`, and `actions`.
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `login` | `url`, `usernameSelector`, `passwordSelector`, `submitSelector`, optional `successSelector`, `usernameEnv`, `passwordEnv` |
+| `waitFor` | Selector that must appear before axe runs |
+| `actions` | Ordered `{ "click": selector }`, `{ "fill": selector, "value": "..." }`, or `{ "wait": 300 }` |
+| `include` / `exclude` | Limit axe to part of the page. Page excludes are added to the global `exclude` list |
+| `failBelow` | `A`, `AA`, or `AAA`. The process exits 1 when a page is below it. Error and Below A are the lowest |
+| `strictExtraChecks` | Count reflow and keyboard findings as failures |
+| `includeBestPractices` | Also run axe best-practice rules. They never change the level |
+| `includeExperimental` | Also run experimental rules such as label-in-name |
+| `wcagVersion` | `2.0`, `2.1`, or `2.2` (default `2.2`). Version 2.2 drops 4.1.1 Parsing |
+| `outputDir` | Used when `--out` is omitted |
+| `maxTabs` | Tab presses for the keyboard heuristic (default 60) |
+| `timeoutMs` | Navigation timeout (default 60000) |
+| `browser` | `chromium`, `firefox`, or `webkit` |
+| `executablePath` | Browser binary. `A11Y_BROWSER_PATH` wins |
+
+### Commands
+
+```bash
+npm run accessibility
+npm run accessibility -- --wcag 2.2 --fail-below AA
+npm run accessibility -- --url https://example.com --name "Home" --out reports/wcag-level
+```
+
+### Output
+
+| File | Contents |
+|---|---|
+| `report.html` | Summary, level journey, roadmap, review items, manual criteria |
+| `issues.csv` | One row per failing issue on each roadmap step |
+| `results.json` | Assessed data, including the keys used for the next run's trend |
+| `screenshots/page-N.png` | Visible area after the scan |
+
+With no `--out` and no `outputDir`, files go to `{OUTPUT_DIR}/wcag-level/{YYYY-MM-DD}/{HHmmss}/`. A second run in the same folder compares rule ids and shows a trend such as `A → A`.
+
+### CI
+
+GitHub Actions workflow [`.github/workflows/a11y.yml`](.github/workflows/a11y.yml) runs on push to `main`, every Monday at 03:00 UTC, and `workflow_dispatch`. It runs `npm run accessibility` against `reports/url/top-urls.json` (or `urls-flat.json`) and reads `A11Y_USER` and `A11Y_PASS` from secrets.
+
+Jenkins:
+
+```bash
+npm ci
+npx playwright install --with-deps chromium
+npm run accessibility -- --fail-below AA
+```
+
+Azure DevOps: the same three commands in a script step, with `A11Y_USER` and `A11Y_PASS` mapped from the variable group, and `reports/` published as a pipeline artifact.
+
+### Where the code lives
+
+The checker stays in the existing `src/a11y` folder next to the axe runner:
+
+- `src/a11y/wcag-criteria.ts` — 87 success criteria and tag helpers
+- `src/a11y/wcag-catalog.ts` — automation kind and applicability for the 86 criteria in the WCAG JSON
+- `src/a11y/wcag-scan.ts` — Playwright and axe
+- `src/a11y/wcag-extra.ts` — reliable checks and page heuristics
+- `src/a11y/wcag-site-checks.ts` — checks that compare pages
+- `src/a11y/wcag-levels.ts` — level, coverage, roadmap, trend
+- `src/report/wcag-level.ts` — HTML report
+- `src/cli/wcag-level.ts` — command line
+
+### Known limits
+
+- Each criterion in the report is Pass, Fail, Needs review, Not tested, or Not applicable. Not applicable means the page has none of the content that criterion is about.
+- Pass means the automated rules for that criterion passed. It is not a conformance certificate. A clean partial check stays Not tested until you mark it.
+- Four checks can fail the automated level: 2.5.3 Label in Name, 1.3.4 Orientation, 2.4.11 Focus Not Obscured (Minimum), and 2.4.12 Focus Not Obscured (Enhanced). Other heuristics stay Needs review unless `strictExtraChecks` is true.
+- Manual and partial rows have Pass, Fail, and Not applicable marks. A Fail lowers the confirmed level in the report. It does not change the automated level or the `--fail-below` exit code.
+- Marks are kept in the browser for that report. Save downloads `manual-checks.json`. On the next scan of the same output folder, that file is applied again.
+- `label-content-name-mismatch` (2.5.3) always runs. Other experimental axe rules still need `includeExperimental`.
+- Enhanced contrast is reported only after AA contrast is fixed. Re-scan between roadmap steps.
+- Each scan covers one page state. Use `actions` to open menus and dialogs. Comparing navigation, names, and help needs more than one page.
+- One page, extra check, or screenshot can fail without stopping the run. An unexpected crash exits 2. `--fail-below` exits 1.

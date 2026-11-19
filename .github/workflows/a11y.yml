@@ -1,0 +1,41 @@
+# Reads reports/url/top-urls.json, or reports/url/urls-flat.json when that file is missing.
+name: Accessibility
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  wcag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: WCAG level scan
+        run: npm run accessibility -- --fail-below AA
+        env:
+          A11Y_USER: ${{ secrets.A11Y_USER }}
+          A11Y_PASS: ${{ secrets.A11Y_PASS }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcag-reports
+          path: reports/
